@@ -72,7 +72,7 @@ func main() {
 func run() error {
 	var o options
 	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4)")
-	flag.IntVar(&o.threads, "t", 16, "fixed concurrent segment downloads per stream (default: adaptive, auto-tuned 4–64)")
+	flag.IntVar(&o.threads, "t", 0, "max concurrent segment downloads per stream — a ceiling, not a fixed count: the downloader auto-tunes up to it and backs off below on rate limits (default: auto-tune up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
@@ -254,8 +254,12 @@ func run() error {
 	progStop := make(chan struct{})
 	go prog.Render(progStop)
 
+	threadCeiling := 0 // 0 = auto-tune (no -t given)
+	if tPinned {
+		threadCeiling = o.threads
+	}
 	cfg := engine.Config{
-		Client: client, Threads: o.threads, Adaptive: !tPinned, Keys: keys, AdFilters: adFilters,
+		Client: client, Threads: threadCeiling, Keys: keys, AdFilters: adFilters,
 		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
 		FromStart: o.liveFromStart,
 	}

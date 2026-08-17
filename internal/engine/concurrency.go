@@ -82,18 +82,38 @@ func (l *limiter) unblock() {
 	l.mu.Unlock()
 }
 
-// controller drives a limiter via AIMD on measured throughput. Workers report
-// bytes and hard errors; the control loop samples them each tick.
+// controller drives a limiter via AIMD on measured throughput, bounded above by
+// a ceiling (the user's -t, or adaptiveMax when unset). Workers report bytes,
+// hard errors, and rate-limit pressure; the control loop samples them per tick.
 type controller struct {
-	lim   *limiter
-	bytes atomic.Int64
-	errs  atomic.Int64
+	lim        *limiter
+	minC, maxC int
+	bytes      atomic.Int64
+	errs       atomic.Int64
+	press      atomic.Int64
 }
 
-func newController() *controller { return &controller{lim: newLimiter(adaptiveStart)} }
+// newController builds a controller whose concurrency never exceeds ceiling.
+// It starts at the usual ramp point (or the ceiling, if lower) and can shrink
+// down to the floor (or the ceiling, if that is lower still).
+func newController(ceiling int) *controller {
+	if ceiling < 1 {
+		ceiling = adaptiveMax
+	}
+	start := adaptiveStart
+	if ceiling < start {
+		start = ceiling
+	}
+	minC := adaptiveMin
+	if ceiling < minC {
+		minC = ceiling
+	}
+	return &controller{lim: newLimiter(start), minC: minC, maxC: ceiling}
+}
 
-func (c *controller) addBytes(n int) { c.bytes.Add(int64(n)) }
-func (c *controller) addErr()        { c.errs.Add(1) }
+func (c *controller) addBytes(n int)      { c.bytes.Add(int64(n)) }
+func (c *controller) addErr()             { c.errs.Add(1) }
+func (c *controller) addPressure(n int)   { c.press.Add(int64(n)) }
 
 // ctlState is the control loop's carried state, split out so the decision is a
 // pure, testable function.
@@ -107,28 +127,28 @@ type ctlState struct {
 // throughput (bytes) and error count. Slow-start doubles while throughput keeps
 // climbing; then additive-increase / multiplicative-decrease keeps it near the
 // point of diminishing returns; any hard error halves and cools down.
-func decide(limit int, tp float64, errs int64, s ctlState) (int, ctlState) {
+func decide(limit int, tp float64, errs int64, minC, maxC int, s ctlState) (int, ctlState) {
 	step := limit / 8
 	if step < 1 {
 		step = 1
 	}
 	switch {
 	case errs > 0:
-		limit = maxInt(adaptiveMin, limit/2)
+		limit = maxInt(minC, limit/2)
 		s.slowStart = false
 		s.cooldown = 2
 	case s.cooldown > 0:
 		s.cooldown--
 	case s.slowStart:
 		if tp > s.prevTP*1.05 {
-			limit = minInt(adaptiveMax, limit*2)
+			limit = minInt(maxC, limit*2)
 		} else {
 			s.slowStart = false
 		}
 	case tp > s.prevTP*1.10:
-		limit = minInt(adaptiveMax, limit+step)
+		limit = minInt(maxC, limit+step)
 	case tp < s.prevTP*0.90:
-		limit = maxInt(adaptiveMin, limit-step)
+		limit = maxInt(minC, limit-step)
 	}
 	s.prevTP = tp
 	return limit, s
@@ -150,13 +170,14 @@ func (c *controller) run(ctx context.Context, verbose func(string, ...any)) {
 		total := c.bytes.Load()
 		tp := float64(total - lastBytes)
 		lastBytes = total
-		errs := c.errs.Swap(0)
+		// rate-limit pressure counts as backoff pressure alongside hard errors
+		errs := c.errs.Swap(0) + c.press.Swap(0)
 		cur := c.lim.getLimit()
-		next, ns := decide(cur, tp, errs, s)
+		next, ns := decide(cur, tp, errs, c.minC, c.maxC, s)
 		s = ns
 		if next != cur {
 			c.lim.setLimit(next)
-			verbose("adaptive: concurrency %d→%d (%.1f MiB/s, %d errs)", cur, next, tp/(1<<20), errs)
+			verbose("adaptive: concurrency %d→%d (%.1f MiB/s, %d backoff)", cur, next, tp/(1<<20), errs)
 		}
 	}
 }

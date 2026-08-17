@@ -29,8 +29,7 @@ import (
 
 type Config struct {
 	Client    *httpx.Client
-	Threads   int  // fixed worker count when Adaptive is false
-	Adaptive  bool // auto-tune concurrency (user did not pin -t)
+	Threads   int                 // concurrency ceiling; 0 = auto (up to adaptiveMax)
 	Keys      map[[16]byte][]byte // CENC content keys by KID (zero KID = bare key)
 	AdFilters []*regexp.Regexp
 	LiveLimit time.Duration   // stop live recording after this long (0 = until end)
@@ -56,9 +55,7 @@ type item struct {
 // DownloadStream downloads st into outPath (raw concatenated media).
 // refresh is non-nil for live streams.
 func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPath string, refresh RefreshFunc) error {
-	if cfg.Threads <= 0 {
-		cfg.Threads = 8
-	}
+	// cfg.Threads is the concurrency ceiling; 0 means auto (handled below).
 	if cfg.Verbose == nil {
 		cfg.Verbose = func(string, ...any) {}
 	}
@@ -96,17 +93,18 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Adaptive concurrency: spawn up to adaptiveMax workers, gated by a
-	// controller-resized limiter, unless the user pinned -t. When pinned, the
-	// worker count is fixed and there is no controller (predictable override).
-	workers := cfg.Threads
-	var ctl *controller
-	if cfg.Adaptive {
-		workers = adaptiveMax
-		ctl = newController()
-		go ctl.run(ctx, cfg.Verbose)
-		go func() { <-ctx.Done(); ctl.lim.unblock() }()
+	// Adaptive concurrency: spawn `ceiling` workers gated by a controller-resized
+	// limiter. -t sets the ceiling (a maximum, not a fixed count); the controller
+	// still ramps up to it and backs off below it on rate-limit pressure. With no
+	// -t the ceiling is adaptiveMax.
+	ceiling := cfg.Threads
+	if ceiling <= 0 {
+		ceiling = adaptiveMax
 	}
+	ctl := newController(ceiling)
+	go ctl.run(ctx, cfg.Verbose)
+	go func() { <-ctx.Done(); ctl.lim.unblock() }()
+	workers := ceiling
 
 	items := make(chan item, workers*2)
 	results := make(chan result, workers*2)
@@ -341,19 +339,18 @@ type result struct {
 
 func worker(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, ctl *controller, items <-chan item, results chan<- result) {
 	for it := range items {
-		if ctl != nil {
-			if err := ctl.lim.acquire(ctx); err != nil {
-				return
-			}
+		if err := ctl.lim.acquire(ctx); err != nil {
+			return
 		}
-		data, err := fetchItem(ctx, cfg, kc, dec, it)
-		if ctl != nil {
-			ctl.lim.release()
-			if err != nil {
-				ctl.addErr()
-			} else {
-				ctl.addBytes(len(data))
-			}
+		data, pressure, err := fetchItem(ctx, cfg, kc, dec, it)
+		ctl.lim.release()
+		if pressure > 0 {
+			ctl.addPressure(pressure)
+		}
+		if err != nil {
+			ctl.addErr()
+		} else {
+			ctl.addBytes(len(data))
 		}
 		select {
 		case results <- result{idx: it.idx, data: data, err: err, url: it.url}:
@@ -363,26 +360,26 @@ func worker(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, c
 	}
 }
 
-func fetchItem(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, it item) ([]byte, error) {
+func fetchItem(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, it item) ([]byte, int, error) {
 	rng := ""
 	if it.rng != nil {
 		rng = it.rng.Header()
 	}
-	data, _, err := cfg.Client.FetchBytes(ctx, it.url, rng)
+	data, _, pressure, err := cfg.Client.FetchBytesEx(ctx, it.url, rng)
 	if err != nil {
-		return nil, err
+		return nil, pressure, err
 	}
 	data = stripFakeImageHeader(data)
 	// CENC fragments are decrypted natively in place; init segments pass through.
 	if !it.isInit && dec != nil && it.key != nil && it.key.Method == manifest.EncCENC {
 		if err := dec.decrypt(data); err != nil {
-			return nil, fmt.Errorf("CENC decrypt: %w", err)
+			return nil, pressure, fmt.Errorf("CENC decrypt: %w", err)
 		}
 	}
 	if it.key != nil && it.key.Method == manifest.EncAES128 {
 		key, err := kc.get(ctx, it.key.URI)
 		if err != nil {
-			return nil, fmt.Errorf("fetch AES key: %w", err)
+			return nil, pressure, fmt.Errorf("fetch AES key: %w", err)
 		}
 		iv := it.key.IV
 		if iv == nil {
@@ -391,13 +388,13 @@ func fetchItem(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor
 		}
 		data, err = decryptAES128CBC(data, key, iv)
 		if err != nil {
-			return nil, err
+			return nil, pressure, err
 		}
 	}
 	if cfg.Progress != nil {
 		cfg.Progress.AddBytes(int64(len(data)))
 	}
-	return data, nil
+	return data, pressure, nil
 }
 
 // stripFakeImageHeader removes fake PNG/JPEG/GIF/BMP prefixes some CDNs

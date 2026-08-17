@@ -39,7 +39,9 @@ Three things to notice:
   merge; see below), or download streams strictly one at a time (vsd).
 - **Concurrency auto-tunes.** With no `-t` flag, m314dl ramps its in-flight
   request count to fit the network (AIMD, 4→64) and backs off from rate-limited
-  servers — hiding round-trip time without a knob to guess. `-t N` pins it.
+  servers (honoring `Retry-After`) — hiding round-trip time without a knob to
+  guess. `-t N` sets a *ceiling*, not a fixed count: it still auto-tunes up to N
+  and backs off below it under pressure.
 - **The numbers are reproducible.** The corpus generator, the throttling
   server, and the exact commands live in [`bench/`](bench/). Re-run them on your
   own hardware — don't trust a copied table.
@@ -81,7 +83,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **DASH**: SegmentTemplate (`$Number$`/`$Time$` + `%0Nd`), SegmentTimeline (negative `@r`), SegmentList, SegmentBase, multi-period (merged with discontinuity markers), namespace-agnostic lenient XML, `cenc:default_KID`
 - **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools
 - **Live recording** for both protocols: starts at the live edge (`-live-from-start` for the whole DVR window), refresh failures retried forever, segment dedupe across refreshes, `-live-duration` limit, **Ctrl-C finishes the recording gracefully and muxes** — you never lose what you already recorded
-- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx — no thread count to guess, and no hammering rate-limited CDNs; `-t N` pins a fixed count
+- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx (honoring `Retry-After`) — no thread count to guess, and no hammering rate-limited CDNs; `-t N` sets a ceiling (auto-tunes up to N, still backs off below it)
 - **One download pipeline** for VOD and live (feeder → worker pool → ordered writer): no duplicated code paths, no fd-per-segment merge ("too many open files" is structurally impossible — output is a single streaming append)
 - **Resume**: interrupted VOD downloads continue exactly where they stopped (byte-exact; a failed segment can never be silently skipped)
 - **Retries with exponential backoff + jitter** that cover mid-body read failures, not just connection setup; status-aware (404 fails fast, 5xx/429 retry)

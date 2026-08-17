@@ -12,7 +12,7 @@ func TestDecideSlowStart(t *testing.T) {
 	limit := adaptiveStart
 	tp := 100.0
 	for i := 0; i < 10; i++ {
-		limit, s = decide(limit, tp, 0, s)
+		limit, s = decide(limit, tp, 0, adaptiveMin, adaptiveMax, s)
 		tp *= 2 // keep improving
 	}
 	if limit != adaptiveMax {
@@ -24,11 +24,11 @@ func TestDecidePlateauHolds(t *testing.T) {
 	// Once throughput stops improving, slow-start ends and the limit holds.
 	s := ctlState{slowStart: true, prevTP: 1000}
 	limit := 32
-	limit, s = decide(limit, 1000, 0, s) // flat vs prevTP → exit slow start
+	limit, s = decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // flat → exit slow start
 	if s.slowStart {
 		t.Fatal("slow-start should have ended on plateau")
 	}
-	got, _ := decide(limit, 1000, 0, s) // still flat → hold
+	got, _ := decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // still flat → hold
 	if got != limit {
 		t.Fatalf("plateau should hold at %d, moved to %d", limit, got)
 	}
@@ -36,7 +36,7 @@ func TestDecidePlateauHolds(t *testing.T) {
 
 func TestDecideErrorHalves(t *testing.T) {
 	s := ctlState{slowStart: false, prevTP: 1000}
-	got, ns := decide(40, 1000, 3, s)
+	got, ns := decide(40, 1000, 3, adaptiveMin, adaptiveMax, s)
 	if got != 20 {
 		t.Fatalf("error should halve 40→20, got %d", got)
 	}
@@ -47,9 +47,34 @@ func TestDecideErrorHalves(t *testing.T) {
 
 func TestDecideRespectsMin(t *testing.T) {
 	s := ctlState{slowStart: false}
-	got, _ := decide(adaptiveMin, 100, 5, s)
+	got, _ := decide(adaptiveMin, 100, 5, adaptiveMin, adaptiveMax, s)
 	if got < adaptiveMin {
 		t.Fatalf("must not drop below min %d, got %d", adaptiveMin, got)
+	}
+}
+
+func TestDecideRespectsCeiling(t *testing.T) {
+	// -t ceiling of 8: slow-start with rising throughput never exceeds 8.
+	s := ctlState{slowStart: true}
+	limit := 8
+	tp := 100.0
+	for i := 0; i < 6; i++ {
+		limit, s = decide(limit, tp, 0, adaptiveMin, 8, s)
+		tp *= 2
+	}
+	if limit > 8 {
+		t.Fatalf("must not exceed ceiling 8, got %d", limit)
+	}
+}
+
+func TestNewControllerCeiling(t *testing.T) {
+	c := newController(8)
+	if c.maxC != 8 || c.lim.getLimit() > 8 {
+		t.Fatalf("ceiling 8: maxC=%d start=%d", c.maxC, c.lim.getLimit())
+	}
+	// unset (0) falls back to the default ceiling
+	if newController(0).maxC != adaptiveMax {
+		t.Fatal("ceiling 0 should default to adaptiveMax")
 	}
 }
 

@@ -91,32 +91,53 @@ func retriable(status int) bool {
 }
 
 type StatusError struct {
-	Code int
-	URL  string
+	Code       int
+	URL        string
+	RetryAfter time.Duration // parsed from the Retry-After header (0 if absent)
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.Code, e.URL) }
 
 // FetchBytes GETs a URL (optionally with a Range header) and returns the full
-// body plus the final post-redirect URL. Retries cover connection errors,
-// retriable statuses AND mid-body read errors, with exponential backoff+jitter.
-func (c *Client) FetchBytes(ctx context.Context, rawURL, rangeHdr string) (body []byte, finalURL string, err error) {
+// body plus the final post-redirect URL.
+func (c *Client) FetchBytes(ctx context.Context, rawURL, rangeHdr string) ([]byte, string, error) {
+	body, finalURL, _, err := c.FetchBytesEx(ctx, rawURL, rangeHdr)
+	return body, finalURL, err
+}
+
+// FetchBytesEx is FetchBytes plus a pressure count: how many times the server
+// pushed back with a retriable status (429/503/…). The concurrency controller
+// uses it to back off before those retries turn into failures. Retries cover
+// connection errors, retriable statuses AND mid-body read errors, with
+// exponential backoff+jitter, and honor a Retry-After header when present.
+func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (body []byte, finalURL string, pressure int, err error) {
 	finalURL = rawURL
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		body, finalURL, err = c.fetchOnce(ctx, rawURL, rangeHdr)
 		if err == nil {
-			return body, finalURL, nil
+			return body, finalURL, pressure, nil
 		}
 		var se *StatusError
-		permanent := errors.As(err, &se) && !retriable(se.Code)
+		isStatus := errors.As(err, &se)
+		if isStatus && retriable(se.Code) {
+			pressure++ // server pushed back — signal even if we recover
+		}
+		permanent := isStatus && !retriable(se.Code)
 		if permanent || attempt >= c.retries || ctx.Err() != nil {
-			return nil, finalURL, err
+			return nil, finalURL, pressure, err
+		}
+		wait := backoff + time.Duration(rand.Int64N(int64(backoff/2)))
+		if isStatus && se.RetryAfter > 0 { // honor Retry-After, capped
+			wait = se.RetryAfter
+			if wait > 30*time.Second {
+				wait = 30 * time.Second
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, finalURL, ctx.Err()
-		case <-time.After(backoff + time.Duration(rand.Int64N(int64(backoff/2)))):
+			return nil, finalURL, pressure, ctx.Err()
+		case <-time.After(wait):
 		}
 		if backoff < 8*time.Second {
 			backoff *= 2
@@ -143,13 +164,32 @@ func (c *Client) fetchOnce(ctx context.Context, rawURL, rangeHdr string) ([]byte
 	}
 	if resp.StatusCode >= 400 {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, final, &StatusError{Code: resp.StatusCode, URL: rawURL}
+		return nil, final, &StatusError{Code: resp.StatusCode, URL: rawURL, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, final, fmt.Errorf("read body: %w", err)
 	}
 	return b, final, nil
+}
+
+// parseRetryAfter reads a Retry-After header (delta-seconds or HTTP-date).
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // Head issues a HEAD request (no retries — callers treat failure as "unknown").
