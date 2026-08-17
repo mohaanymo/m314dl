@@ -9,3 +9,6 @@
 # benchmark artifacts
 /bench/fixtures/
 /bench/benchwork/
+
+# release artifacts
+/dist/
