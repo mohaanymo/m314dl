@@ -89,6 +89,13 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		return err
 	}
 	defer out.Close()
+	// Resuming: segments already written count as done, so progress and ETA
+	// reflect real remaining work instead of restarting from 0/N.
+	if cfg.Progress != nil {
+		if n := state.NextIdx.Load(); n > 0 {
+			cfg.Progress.AddDone(n)
+		}
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -187,11 +194,16 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 	return st, f, nil
 }
 
+// save persists the resume checkpoint atomically (write-tmp + rename), so a
+// process killed without warning mid-write can never leave a torn state file.
 func (s *resumeState) save(outPath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, _ := json.Marshal(resumeSnapshot{NextIdx: s.NextIdx.Load(), Offset: s.Offset})
-	os.WriteFile(statePath(outPath), b, 0o644)
+	tmp := statePath(outPath) + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) == nil {
+		os.Rename(tmp, statePath(outPath))
+	}
 }
 
 // ---- feeder ----
@@ -506,6 +518,7 @@ func decryptAES128CBC(data, key, iv []byte) ([]byte, error) {
 func writer(cfg Config, live bool, out *os.File, outPath string, state *resumeState, results <-chan result) error {
 	pending := map[int64][]byte{}
 	var failed error
+	var lastSave time.Time // zero => first advance checkpoints immediately
 	for r := range results {
 		if r.err != nil {
 			if failed == nil {
@@ -538,9 +551,20 @@ func writer(cfg Config, live bool, out *os.File, outPath string, state *resumeSt
 			if cfg.Progress != nil {
 				cfg.Progress.AddDone(1)
 			}
+			// Checkpoint frequently: this process may be killed without warning
+			// (a raw-mode TUI turns Ctrl-C into a keypress, not a signal), so the
+			// resume state must be current *before* the kill, not flushed lazily.
+			// Coalesce to ~2/s so a burst of tiny segments doesn't thrash the disk
+			// in the hot path; large segments (>500ms each — the case that loses
+			// the most on a kill) still checkpoint on every advance. The write is
+			// atomic. fsync stays periodic (power-loss hardening; openOutput
+			// self-heals a state file that got ahead of unsynced data).
+			if time.Since(lastSave) >= 500*time.Millisecond {
+				state.save(outPath)
+				lastSave = time.Now()
+			}
 			if next%20 == 0 {
 				out.Sync()
-				state.save(outPath)
 			}
 		}
 	}

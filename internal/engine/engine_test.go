@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -143,5 +144,52 @@ func TestTempStreamPathIsolation(t *testing.T) {
 	// lives beside the output, not in some scratch dir
 	if got := filepath.Dir(a); got != "/lib/Show/Season 01" {
 		t.Fatalf("temp not beside output: %q", got)
+	}
+}
+
+// TestDownloadStreamResume simulates an interrupted run (checkpoint on disk)
+// and verifies the rerun skips already-done segments, appends byte-exact, and
+// seeds progress from the checkpoint instead of restarting at 0.
+func TestDownloadStreamResume(t *testing.T) {
+	var requested sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested.Store(r.URL.Path, true)
+		fmt.Fprintf(w, "[%s]", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	st := &manifest.Stream{ID: "t", Type: manifest.Video}
+	for i := 0; i < 5; i++ {
+		st.Segments = append(st.Segments, manifest.Segment{
+			URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: 1,
+		})
+	}
+	out := filepath.Join(t.TempDir(), "out.ts")
+	// a prior run wrote the first two segments and checkpointed
+	prefix := "[/seg0][/seg1]"
+	os.WriteFile(out, []byte(prefix), 0o644)
+	os.WriteFile(out+".m314dl-state", []byte(fmt.Sprintf(`{"next_idx":2,"offset":%d}`, len(prefix))), 0o644)
+
+	prog := NewProgress(false, 0)
+	client, _ := httpx.New(httpx.Options{Retries: 2})
+	if err := DownloadStream(context.Background(), Config{Client: client, Threads: 2, Progress: prog}, st, out, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	b, _ := os.ReadFile(out)
+	if string(b) != "[/seg0][/seg1][/seg2][/seg3][/seg4]" {
+		t.Fatalf("resumed output = %q", b)
+	}
+	if _, ok := requested.Load("/seg0"); ok {
+		t.Fatal("seg0 re-downloaded on resume")
+	}
+	if _, ok := requested.Load("/seg1"); ok {
+		t.Fatal("seg1 re-downloaded on resume")
+	}
+	if d := prog.done.Load(); d != 5 {
+		t.Fatalf("progress done = %d, want 5 (2 seeded + 3 new)", d)
+	}
+	if _, err := os.Stat(out + ".m314dl-state"); !os.IsNotExist(err) {
+		t.Fatal("state file should be removed on success")
 	}
 }
