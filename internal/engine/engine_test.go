@@ -193,3 +193,61 @@ func TestDownloadStreamResume(t *testing.T) {
 		t.Fatal("state file should be removed on success")
 	}
 }
+
+// TestIntraSegmentResume proves byte-range resume within a single segment: a
+// partial part file on disk is completed with a Range request, not re-fetched
+// from scratch.
+func TestIntraSegmentResume(t *testing.T) {
+	content := func(i int) []byte { return bytes.Repeat([]byte{byte('A' + i)}, 100) }
+	var ranges sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var i int
+		fmt.Sscanf(r.URL.Path, "/seg%d", &i)
+		full := content(i)
+		if rh := r.Header.Get("Range"); rh != "" {
+			ranges.Store(r.URL.Path, rh)
+			var start int
+			fmt.Sscanf(rh, "bytes=%d-", &start)
+			if start >= len(full) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(full)-1, len(full)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(full[start:])
+			return
+		}
+		w.Write(full)
+	}))
+	defer srv.Close()
+
+	st := &manifest.Stream{ID: "t", Type: manifest.Video}
+	for i := 0; i < 3; i++ {
+		st.Segments = append(st.Segments, manifest.Segment{
+			URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: 1,
+		})
+	}
+	out := filepath.Join(t.TempDir(), "out.ts")
+	// a prior run got 30 of seg1's 100 bytes before being killed
+	if err := os.WriteFile(partPath(out, 1), content(1)[:30], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client, _ := httpx.New(httpx.Options{Retries: 3})
+	if err := DownloadStream(context.Background(), Config{Client: client, Threads: 2}, st, out, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	b, _ := os.ReadFile(out)
+	want := append(append(content(0), content(1)...), content(2)...)
+	if !bytes.Equal(b, want) {
+		t.Fatalf("output mismatch: got %d bytes, want %d", len(b), len(want))
+	}
+	// seg1 resumed from byte 30; seg0/seg2 fetched fresh (no Range)
+	if rh, ok := ranges.Load("/seg1"); !ok || rh.(string) != "bytes=30-" {
+		t.Fatalf("seg1 should resume with Range bytes=30-, got %v", rh)
+	}
+	if _, ok := ranges.Load("/seg0"); ok {
+		t.Fatal("seg0 should not be range-requested")
+	}
+}

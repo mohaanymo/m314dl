@@ -122,12 +122,12 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, cfg, kc, dec, ctl, items, results)
+			worker(ctx, cfg, ctl, outPath, items, results)
 		}()
 	}
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- writer(cfg, st.Live, out, outPath, state, results)
+		writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, results)
 	}()
 
 	feedErr := feed(ctx, cfg, st, refresh, state, items)
@@ -343,55 +343,47 @@ func skipAd(filters []*regexp.Regexp, u string) bool {
 // ---- workers ----
 
 type result struct {
-	idx  int64
-	data []byte
-	err  error
-	url  string
+	it       item
+	err      error
+	pressure int
 }
 
-func worker(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, ctl *controller, items <-chan item, results chan<- result) {
+// worker streams each segment to its part file. It does not decrypt or hold the
+// segment in memory — the writer decrypts and assembles in order.
+func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, items <-chan item, results chan<- result) {
 	for it := range items {
 		if err := ctl.lim.acquire(ctx); err != nil {
 			return
 		}
-		data, pressure, err := fetchItem(ctx, cfg, kc, dec, it)
+		pressure, err := downloadSegment(ctx, cfg, ctl, it, partPath(outPath, it.idx))
 		ctl.lim.release()
 		if pressure > 0 {
 			ctl.addPressure(pressure)
 		}
 		if err != nil {
 			ctl.addErr()
-		} else {
-			ctl.addBytes(len(data))
 		}
 		select {
-		case results <- result{idx: it.idx, data: data, err: err, url: it.url}:
+		case results <- result{it: it, err: err, pressure: pressure}:
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func fetchItem(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, it item) ([]byte, int, error) {
-	rng := ""
-	if it.rng != nil {
-		rng = it.rng.Header()
-	}
-	data, _, pressure, err := cfg.Client.FetchBytesEx(ctx, it.url, rng)
-	if err != nil {
-		return nil, pressure, err
-	}
+// decryptSegment applies the same in-place transforms the old inline path did,
+// in the same order: strip fake image header, then CENC, then AES-128.
+func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, it item, data []byte) ([]byte, error) {
 	data = stripFakeImageHeader(data)
-	// CENC fragments are decrypted natively in place; init segments pass through.
 	if !it.isInit && dec != nil && it.key != nil && it.key.Method == manifest.EncCENC {
 		if err := dec.decrypt(data); err != nil {
-			return nil, pressure, fmt.Errorf("CENC decrypt: %w", err)
+			return nil, fmt.Errorf("CENC decrypt: %w", err)
 		}
 	}
 	if it.key != nil && it.key.Method == manifest.EncAES128 {
 		key, err := kc.get(ctx, it.key.URI)
 		if err != nil {
-			return nil, pressure, fmt.Errorf("fetch AES key: %w", err)
+			return nil, fmt.Errorf("fetch AES key: %w", err)
 		}
 		iv := it.key.IV
 		if iv == nil {
@@ -400,13 +392,10 @@ func fetchItem(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor
 		}
 		data, err = decryptAES128CBC(data, key, iv)
 		if err != nil {
-			return nil, pressure, err
+			return nil, err
 		}
 	}
-	if cfg.Progress != nil {
-		cfg.Progress.AddBytes(int64(len(data)))
-	}
-	return data, pressure, nil
+	return data, nil
 }
 
 // stripFakeImageHeader removes fake PNG/JPEG/GIF/BMP prefixes some CDNs
@@ -515,54 +504,80 @@ func decryptAES128CBC(data, key, iv []byte) ([]byte, error) {
 
 // ---- ordered writer ----
 
-func writer(cfg Config, live bool, out *os.File, outPath string, state *resumeState, results <-chan result) error {
-	pending := map[int64][]byte{}
+// pend records a downloaded-but-not-yet-committed segment: either an item whose
+// part file is on disk, or a live hole (failed segment, skipped).
+type pend struct {
+	it   item
+	hole bool
+}
+
+func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+	pending := map[int64]pend{}
 	var failed error
-	var lastSave time.Time // zero => first advance checkpoints immediately
+
+	// commit decrypts one segment's part file and appends it to the output.
+	// ponytail: reads the whole part file into memory to decrypt (CENC/AES need
+	// the full segment); peak memory is one segment, not one per worker. A
+	// stream-copy fast path for clear segments could drop that to O(buffer) if a
+	// pathological huge-clear-segment case ever shows up.
+	commit := func(idx int64, p pend) error {
+		if p.hole {
+			return nil
+		}
+		part := partPath(outPath, idx)
+		data, err := os.ReadFile(part)
+		if err != nil {
+			return fmt.Errorf("read segment %d: %w", idx, err)
+		}
+		data, err = decryptSegment(ctx, kc, dec, p.it, data)
+		if err != nil {
+			return err
+		}
+		if _, err := out.Write(data); err != nil {
+			return err
+		}
+		state.Offset += int64(len(data))
+		os.Remove(part)
+		return nil
+	}
+
 	for r := range results {
 		if r.err != nil {
 			if failed == nil {
-				failed = fmt.Errorf("segment %d (%s): %w", r.idx, r.url, r.err)
+				failed = fmt.Errorf("segment %d (%s): %w", r.it.idx, r.it.url, r.err)
 			}
-			cfg.Verbose("segment failed: %s: %v", r.url, r.err)
+			cfg.Verbose("segment failed: %s: %v", r.it.url, r.err)
 			if live {
 				// live: the segment is gone; hole keeps the recording moving
-				pending[r.idx] = nil
+				pending[r.it.idx] = pend{hole: true}
 			}
-			// VOD: no hole — the resume index must not advance past a
-			// failed segment, or resume would silently skip it
+			// VOD: no hole — the resume index must not advance past a failed
+			// segment, or resume would silently skip it
 			continue
 		}
-		pending[r.idx] = r.data
+		pending[r.it.idx] = pend{it: r.it}
 		for {
 			idx := state.NextIdx.Load()
-			data, ok := pending[idx]
+			p, ok := pending[idx]
 			if !ok {
 				break
 			}
 			delete(pending, idx)
-			if data != nil {
-				if _, err := out.Write(data); err != nil {
-					return err
-				}
-				state.Offset += int64(len(data))
+			if err := commit(idx, p); err != nil {
+				return err
 			}
 			next := state.NextIdx.Add(1)
 			if cfg.Progress != nil {
 				cfg.Progress.AddDone(1)
 			}
-			// Checkpoint frequently: this process may be killed without warning
-			// (a raw-mode TUI turns Ctrl-C into a keypress, not a signal), so the
-			// resume state must be current *before* the kill, not flushed lazily.
-			// Coalesce to ~2/s so a burst of tiny segments doesn't thrash the disk
-			// in the hot path; large segments (>500ms each — the case that loses
-			// the most on a kill) still checkpoint on every advance. The write is
-			// atomic. fsync stays periodic (power-loss hardening; openOutput
-			// self-heals a state file that got ahead of unsynced data).
-			if time.Since(lastSave) >= 500*time.Millisecond {
-				state.save(outPath)
-				lastSave = time.Now()
-			}
+			// Checkpoint on every commit. This process may be killed without
+			// warning (a raw-mode TUI turns Ctrl-C into a keypress, not a signal),
+			// so the state must match what's on disk *before* the kill: a stale
+			// offset would make openOutput truncate committed data and re-download
+			// it. The uncommitted tail still resumes from its part files, so a kill
+			// costs at most the one segment being written. The write is atomic and
+			// tiny; fsync stays periodic (power-loss hardening).
+			state.save(outPath)
 			if next%20 == 0 {
 				out.Sync()
 			}
@@ -570,7 +585,7 @@ func writer(cfg Config, live bool, out *os.File, outPath string, state *resumeSt
 	}
 	out.Sync()
 	state.save(outPath)
-	// flush stragglers is impossible: missing index means download failed
+	// missing index means the segment failed to download
 	if len(pending) > 0 && failed == nil {
 		failed = fmt.Errorf("%d segments missing at end of stream", len(pending))
 	}

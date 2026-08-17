@@ -79,6 +79,31 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.hc.Do(req)
 }
 
+// Retries is the configured per-request retry count.
+func (c *Client) Retries() int { return c.retries }
+
+// Retriable reports whether a status is worth retrying (exported for streaming
+// callers that run their own retry loop).
+func Retriable(status int) bool { return retriable(status) }
+
+// ParseRetryAfter parses a Retry-After header value (exported).
+func ParseRetryAfter(v string) time.Duration { return parseRetryAfter(v) }
+
+// RangeGet issues a single GET with the given Range header (default headers,
+// cookies and proxy applied) and returns the response for streaming. The caller
+// owns resp.Body and runs its own retry loop. No redirects-vs-headers subtlety
+// beyond the shared client's.
+func (c *Client) RangeGet(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if rangeHdr != "" {
+		req.Header.Set("Range", rangeHdr)
+	}
+	return c.Do(req)
+}
+
 // retriable reports whether an HTTP status is worth retrying.
 func retriable(status int) bool {
 	switch status {
