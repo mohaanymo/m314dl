@@ -1,0 +1,11 @@
+/m314dl
+*.mp4
+*.ts
+*.mkv
+*.m4s
+*.m314dl-state
+*.rawsub
+
+# benchmark artifacts
+/bench/fixtures/
+/bench/benchwork/

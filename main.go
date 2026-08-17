@@ -1,0 +1,505 @@
+// m314dl — HLS/DASH media downloader.
+//
+// Usage: m314dl [flags] <URL>
+// URL may be a master/media playlist (.m3u8), a DASH manifest (.mpd), or a
+// web page (m314dl scrapes it for stream URLs).
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/mohamed/m314dl/internal/dash"
+	"github.com/mohamed/m314dl/internal/engine"
+	"github.com/mohamed/m314dl/internal/hls"
+	"github.com/mohamed/m314dl/internal/httpx"
+	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mux"
+	"github.com/mohamed/m314dl/internal/pick"
+	"github.com/mohamed/m314dl/internal/scrape"
+	"github.com/mohamed/m314dl/internal/subs"
+)
+
+const version = "0.1.0"
+
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ", ") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+type options struct {
+	output        string
+	threads       int
+	headers       multiFlag
+	cookies       string
+	proxy         string
+	insecure      bool
+	retries       int
+	listOnly      bool
+	sv, sa, ss    string
+	adKeywords    multiFlag
+	liveLimit     time.Duration
+	liveFromStart bool
+	noMux         bool
+	keepTemp      bool
+	subFormat     string
+	verbose       bool
+	timeout       time.Duration
+	keys          multiFlag
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "m314dl: error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var o options
+	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4)")
+	flag.IntVar(&o.threads, "t", 16, "download threads per stream")
+	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
+	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
+	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
+	flag.BoolVar(&o.insecure, "insecure", false, "skip TLS certificate verification")
+	flag.IntVar(&o.retries, "retries", 5, "retries per request (covers mid-body failures)")
+	flag.BoolVar(&o.listOnly, "list", false, "list streams and exit")
+	flag.StringVar(&o.sv, "sv", "best", "video select: best|worst|all|bestN|key=regex[:...] (keys: id,lang,name,codecs,res,bwmin,bwmax)")
+	flag.StringVar(&o.sa, "sa", "", "audio select (default: best per language, video's group preferred)")
+	flag.StringVar(&o.ss, "ss", "", "subtitle select (default: all)")
+	flag.Var(&o.adKeywords, "ad-keyword", "regex; matching segment URLs are skipped as ads (repeatable, live too)")
+	flag.DurationVar(&o.liveLimit, "live-duration", 0, "stop live recording after this duration (e.g. 1h30m)")
+	flag.BoolVar(&o.liveFromStart, "live-from-start", false, "live: download the whole DVR window instead of starting at the live edge")
+	flag.BoolVar(&o.noMux, "no-mux", false, "keep raw per-stream files, skip ffmpeg")
+	flag.BoolVar(&o.keepTemp, "keep", false, "keep temp stream files after mux")
+	flag.Var(&o.keys, "key", "CENC content key 'KID:KEY' (hex; KID dashes optional) or bare 'KEY' (repeatable). Enables native in-process DRM decryption — no mp4decrypt needed")
+	flag.StringVar(&o.subFormat, "sub-format", "srt", "subtitle output: srt or vtt")
+	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
+	flag.DurationVar(&o.timeout, "timeout", 0, "per-request timeout (default none; retries handle stalls)")
+	showVersion := flag.Bool("version", false, "print version")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("m314dl", version)
+		return nil
+	}
+	if flag.NArg() != 1 {
+		flag.Usage()
+		return fmt.Errorf("exactly one URL required")
+	}
+	inputURL := flag.Arg(0)
+
+	logv := func(format string, args ...any) {
+		if o.verbose {
+			fmt.Fprintf(os.Stderr, "[v] "+format+"\n", args...)
+		}
+	}
+
+	headers := map[string]string{}
+	for _, h := range o.headers {
+		k, v, ok := strings.Cut(h, ":")
+		if !ok {
+			return fmt.Errorf("bad header %q (want 'Key: Value')", h)
+		}
+		headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	client, err := httpx.New(httpx.Options{
+		Headers: headers, Proxy: o.proxy, CookieFile: o.cookies,
+		Insecure: o.insecure, Timeout: o.timeout, Retries: o.retries,
+	})
+	if err != nil {
+		return err
+	}
+
+	var adFilters []*regexp.Regexp
+	for _, k := range o.adKeywords {
+		re, err := regexp.Compile(k)
+		if err != nil {
+			return fmt.Errorf("bad -ad-keyword %q: %w", k, err)
+		}
+		adFilters = append(adFilters, re)
+	}
+
+	keys, err := parseKeys(o.keys)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopLive := make(chan struct{})
+
+	// fetch + detect manifest (scraping web pages transparently)
+	master, kind, err := loadManifest(ctx, client, inputURL, logv)
+	if err != nil {
+		return err
+	}
+
+	ve, err := pick.ParseExpr(o.sv)
+	if err != nil {
+		return fmt.Errorf("-sv: %w", err)
+	}
+	var ae, se *pick.Expr
+	if o.sa != "" {
+		if ae, err = pick.ParseExpr(o.sa); err != nil {
+			return fmt.Errorf("-sa: %w", err)
+		}
+	}
+	if o.ss != "" {
+		if se, err = pick.ParseExpr(o.ss); err != nil {
+			return fmt.Errorf("-ss: %w", err)
+		}
+	}
+
+	if o.listOnly {
+		pick.Sort(master.Streams)
+		for _, st := range master.Streams {
+			fmt.Printf("%-4s %s\n", st.ID, st)
+		}
+		return nil
+	}
+
+	selected := pick.Select(master.Streams, ve, ae, se)
+	if len(selected) == 0 {
+		return fmt.Errorf("no streams matched the selection")
+	}
+	for _, st := range selected {
+		fmt.Fprintf(os.Stderr, "selected: %-4s %s\n", st.ID, st)
+	}
+
+	// expand HLS media playlists for selected streams only
+	live := master.Live
+	for _, st := range selected {
+		if kind == "hls" && !st.SegmentsFull {
+			body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
+			if err != nil {
+				return fmt.Errorf("fetch media playlist for %s: %w", st.ID, err)
+			}
+			st.PlaylistURL = finalURL
+			if err := hls.ParseMedia(body, finalURL, st); err != nil {
+				return err
+			}
+		}
+		if st.Live {
+			live = true
+		}
+		if len(st.Segments) == 0 {
+			return fmt.Errorf("stream %s has no segments", st.ID)
+		}
+		if k := st.Segments[0].Key; k != nil && k.Method == manifest.EncCENC && len(keys) == 0 {
+			return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
+		}
+	}
+
+	outPath := outputPath(o.output, inputURL, live)
+	workDir := filepath.Dir(outPath)
+	ffmpeg, ffErr := mux.FindFFmpeg()
+	if !o.noMux && ffErr != nil {
+		return fmt.Errorf("ffmpeg not found (needed for muxing; use -no-mux to skip): %w", ffErr)
+	}
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		if live {
+			// live: stop discovering, drain pipeline, mux what we have
+			fmt.Fprintln(os.Stderr, "\ninterrupt: finishing recording (press again to abort)")
+			close(stopLive)
+		} else {
+			// VOD: cancel now; resume state lets the next run continue
+			fmt.Fprintln(os.Stderr, "\ninterrupt: stopping (rerun the same command to resume)")
+			cancel()
+		}
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "aborted")
+		cancel()
+		os.Exit(130)
+	}()
+
+	prog := engine.NewProgress(live)
+	progStop := make(chan struct{})
+	go prog.Render(progStop)
+
+	cfg := engine.Config{
+		Client: client, Threads: o.threads, Keys: keys, AdFilters: adFilters,
+		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
+		FromStart: o.liveFromStart,
+	}
+
+	type done struct {
+		st   *manifest.Stream
+		path string
+	}
+	var results []done
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(4) // concurrent streams; threads apply within each
+	for _, st := range selected {
+		results = append(results, done{st: st, path: engine.TempStreamPath(workDir, st, rawExt(st))})
+	}
+	for i := range results {
+		r := &results[i]
+		g.Go(func() error {
+			refresh := refreshFunc(client, kind, r.st, logv)
+			if !r.st.Live {
+				refresh = nil
+			}
+			if err := engine.DownloadStream(gctx, cfg, r.st, r.path, refresh); err != nil {
+				return fmt.Errorf("stream %s: %w", r.st.ID, err)
+			}
+			return nil
+		})
+	}
+	err = g.Wait()
+	close(progStop)
+	time.Sleep(50 * time.Millisecond) // let renderer print the final line
+	if err != nil {
+		return err
+	}
+
+	// subtitles: normalize raw payloads into srt/vtt
+	var muxInputs []mux.Input
+	for _, r := range results {
+		if r.st.Type != manifest.Subtitles {
+			muxInputs = append(muxInputs, mux.Input{
+				Path: r.path, Type: r.st.Type, Language: r.st.Language,
+				Name: r.st.Name, Default: r.st.Default,
+			})
+			continue
+		}
+		subPath, err := convertSubtitle(r.path, o.subFormat, ffmpeg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: subtitle %s conversion failed (%v); keeping raw file %s\n", r.st.ID, err, r.path)
+			continue
+		}
+		muxInputs = append(muxInputs, mux.Input{
+			Path: subPath, Type: manifest.Subtitles, Language: r.st.Language,
+			Name: r.st.Name, Default: r.st.Default,
+		})
+	}
+
+	if o.noMux {
+		fmt.Fprintln(os.Stderr, "done (raw streams kept):")
+		for _, r := range results {
+			fmt.Fprintln(os.Stderr, "  "+r.path)
+		}
+		return nil
+	}
+
+	if err := mux.Mux(ffmpeg, muxInputs, outPath); err != nil {
+		fmt.Fprintf(os.Stderr, "mux failed; raw stream files kept in %s\n", workDir)
+		return err
+	}
+	if !o.keepTemp {
+		for _, in := range muxInputs {
+			os.Remove(in.Path)
+		}
+		for _, r := range results { // raw subtitle payloads too
+			os.Remove(r.path)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "done: "+outPath)
+	return nil
+}
+
+// parseKeys parses -key values into a KID→key map. Each value is "KID:KEY"
+// (hex, KID dashes optional) or a bare "KEY" (stored under the zero KID, used
+// when exactly one key is given and the KID does not match).
+func parseKeys(vals []string) (map[[16]byte][]byte, error) {
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	out := map[[16]byte][]byte{}
+	for _, v := range vals {
+		kidStr, keyStr, hasKID := strings.Cut(v, ":")
+		if !hasKID {
+			kidStr, keyStr = "", v
+		}
+		key, err := hex.DecodeString(strings.TrimSpace(keyStr))
+		if err != nil || len(key) != 16 {
+			return nil, fmt.Errorf("bad -key %q: key must be 32 hex chars (16 bytes)", v)
+		}
+		var kid [16]byte
+		if hasKID {
+			k, err := hex.DecodeString(strings.ReplaceAll(strings.TrimSpace(kidStr), "-", ""))
+			if err != nil || len(k) != 16 {
+				return nil, fmt.Errorf("bad -key %q: KID must be 32 hex chars (16 bytes)", v)
+			}
+			copy(kid[:], k)
+		}
+		out[kid] = key
+	}
+	return out, nil
+}
+
+// loadManifest fetches the input, sniffs HLS/DASH, and falls back to
+// scraping when the input is a web page.
+func loadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
+	body, finalURL, err := client.FetchBytes(ctx, inputURL, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
+	}
+	if hls.IsHLS(body) {
+		m, err := hls.ParseMaster(body, finalURL)
+		return m, "hls", err
+	}
+	if dash.IsDASH(body) {
+		m, err := dash.Parse(body, finalURL)
+		return m, "dash", err
+	}
+	// probably a web page: scrape it
+	logv("input is not a manifest; scraping page for stream URLs")
+	candidates, err := scrape.Find(ctx, client, inputURL)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(candidates) == 0 {
+		return nil, "", fmt.Errorf("no HLS/DASH manifest found at %s (not a playlist, and page scan found no stream URLs)", inputURL)
+	}
+	for _, c := range candidates {
+		fmt.Fprintln(os.Stderr, "found stream: "+c)
+	}
+	first := candidates[0]
+	logv("using first candidate: %s", first)
+	body, finalURL, err = client.FetchBytes(ctx, first, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch scraped %s: %w", first, err)
+	}
+	switch {
+	case hls.IsHLS(body):
+		m, err := hls.ParseMaster(body, finalURL)
+		return m, "hls", err
+	case dash.IsDASH(body):
+		m, err := dash.Parse(body, finalURL)
+		return m, "dash", err
+	}
+	return nil, "", fmt.Errorf("scraped URL %s is not a recognizable manifest", first)
+}
+
+func refreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv func(string, ...any)) engine.RefreshFunc {
+	return func(ctx context.Context) (*manifest.Stream, error) {
+		body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
+		if err != nil {
+			return nil, err
+		}
+		if kind == "hls" {
+			fresh := *st
+			fresh.Segments = nil
+			if err := hls.ParseMedia(body, finalURL, &fresh); err != nil {
+				return nil, err
+			}
+			return &fresh, nil
+		}
+		m, err := dash.Parse(body, finalURL)
+		if err != nil {
+			return nil, err
+		}
+		for _, cand := range m.Streams {
+			if cand.ID == st.ID {
+				return cand, nil
+			}
+		}
+		logv("live: stream %s missing from refreshed MPD", st.ID)
+		return nil, fmt.Errorf("stream %s no longer in MPD", st.ID)
+	}
+}
+
+func rawExt(st *manifest.Stream) string {
+	if st.Type == manifest.Subtitles {
+		return ".rawsub"
+	}
+	u := ""
+	if len(st.Segments) > 0 {
+		u = st.Segments[0].URL
+	}
+	if st.Init != nil || strings.Contains(u, ".m4s") || strings.Contains(u, ".mp4") {
+		return ".mp4"
+	}
+	return ".ts"
+}
+
+func outputPath(out, inputURL string, live bool) string {
+	if out != "" {
+		if filepath.Ext(out) == "" {
+			out += ".mp4"
+		}
+		return out
+	}
+	name := "m314dl-output"
+	if u, err := url.Parse(inputURL); err == nil {
+		base := filepath.Base(u.Path)
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+		if base != "" && base != "/" && base != "." {
+			name = base
+		}
+	}
+	if len(name) > 120 {
+		name = name[:120]
+	}
+	if live {
+		name += "-" + time.Now().Format("20060102-150405")
+	}
+	return name + ".mp4"
+}
+
+// convertSubtitle normalizes a raw subtitle stream file to srt/vtt.
+func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
+	b, err := os.ReadFile(rawPath)
+	if err != nil {
+		return "", err
+	}
+	outPath := strings.TrimSuffix(rawPath, ".rawsub") + "." + format
+	kind := subs.Sniff(b)
+	if kind == subs.KindFMP4 {
+		// stpp: TTML documents live in mdat — extract natively (ffmpeg has
+		// no TTML decoder)
+		if mdat := subs.ExtractMdat(b); subs.IsTTMLPayload(mdat) {
+			b = mdat
+			kind = subs.KindTTML
+		}
+	}
+	if kind == subs.KindFMP4 {
+		if ffmpeg == "" {
+			return "", errors.New("fMP4 subtitles need ffmpeg")
+		}
+		// ffmpeg reads mp4-wrapped wvtt/stpp fine; rename so it sniffs mp4
+		mp4Path := strings.TrimSuffix(rawPath, ".rawsub") + ".sub.mp4"
+		if err := os.Rename(rawPath, mp4Path); err != nil {
+			return "", err
+		}
+		defer os.Rename(mp4Path, rawPath)
+		if err := mux.ExtractSubtitle(ffmpeg, mp4Path, outPath); err != nil {
+			return "", err
+		}
+		return outPath, nil
+	}
+	cues, err := subs.Parse(b, kind)
+	if err != nil {
+		return "", err
+	}
+	if len(cues) == 0 {
+		return "", errors.New("no cues found")
+	}
+	cues = subs.Rebase(cues)
+	if format == "vtt" {
+		return outPath, subs.WriteVTT(outPath, cues)
+	}
+	return outPath, subs.WriteSRT(outPath, cues)
+}
