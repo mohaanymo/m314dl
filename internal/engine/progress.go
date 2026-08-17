@@ -80,7 +80,11 @@ func fmtBytes(b int64) string {
 	return fmt.Sprintf("%dB", b)
 }
 
-// Line renders one status line.
+// Line renders one status line. The two shapes below (VOD: "pct% | done/total
+// segs | bytes | speed/s | ETA x"; live: "REC elapsed | segs | bytes | speed/s")
+// are a stable, machine-parseable contract — external tools parse the piped
+// stderr output — so keep the field order and separators stable; "ETA ?" is the
+// deliberate unknown-ETA sentinel.
 func (p *Progress) Line() string {
 	done, total := p.done.Load(), p.total.Load()
 	bytes := p.bytes.Load()
