@@ -71,7 +71,7 @@ func main() {
 func run() error {
 	var o options
 	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4)")
-	flag.IntVar(&o.threads, "t", 16, "download threads per stream")
+	flag.IntVar(&o.threads, "t", 16, "fixed concurrent segment downloads per stream (default: adaptive, auto-tuned 4–64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
@@ -100,6 +100,13 @@ func run() error {
 		fmt.Println("m314dl", version)
 		return nil
 	}
+	// Adaptive concurrency unless the user pinned -t.
+	tPinned := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "t" {
+			tPinned = true
+		}
+	})
 	if flag.NArg() != 1 {
 		flag.Usage()
 		return fmt.Errorf("exactly one URL required")
@@ -239,7 +246,7 @@ func run() error {
 	go prog.Render(progStop)
 
 	cfg := engine.Config{
-		Client: client, Threads: o.threads, Keys: keys, AdFilters: adFilters,
+		Client: client, Threads: o.threads, Adaptive: !tPinned, Keys: keys, AdFilters: adFilters,
 		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
 		FromStart: o.liveFromStart,
 	}

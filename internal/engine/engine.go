@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mohamed/m314dl/internal/httpx"
@@ -28,7 +29,8 @@ import (
 
 type Config struct {
 	Client    *httpx.Client
-	Threads   int
+	Threads   int  // fixed worker count when Adaptive is false
+	Adaptive  bool // auto-tune concurrency (user did not pin -t)
 	Keys      map[[16]byte][]byte // CENC content keys by KID (zero KID = bare key)
 	AdFilters []*regexp.Regexp
 	LiveLimit time.Duration   // stop live recording after this long (0 = until end)
@@ -91,18 +93,31 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	}
 	defer out.Close()
 
-	items := make(chan item, cfg.Threads*2)
-	results := make(chan result, cfg.Threads*2)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Adaptive concurrency: spawn up to adaptiveMax workers, gated by a
+	// controller-resized limiter, unless the user pinned -t. When pinned, the
+	// worker count is fixed and there is no controller (predictable override).
+	workers := cfg.Threads
+	var ctl *controller
+	if cfg.Adaptive {
+		workers = adaptiveMax
+		ctl = newController()
+		go ctl.run(ctx, cfg.Verbose)
+		go func() { <-ctx.Done(); ctl.lim.unblock() }()
+	}
+
+	items := make(chan item, workers*2)
+	results := make(chan result, workers*2)
+
 	var wg sync.WaitGroup
 	kc := &keyCache{client: cfg.Client}
-	for i := 0; i < cfg.Threads; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, cfg, kc, dec, items, results)
+			worker(ctx, cfg, kc, dec, ctl, items, results)
 		}()
 	}
 	writerDone := make(chan error, 1)
@@ -131,10 +146,19 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 
 // ---- resume state ----
 
+// resumeState is shared between the feeder (reads NextIdx) and the writer
+// (advances NextIdx, owns Offset), so NextIdx is atomic. Offset is written only
+// by the writer and read only within writer-goroutine saves.
 type resumeState struct {
+	NextIdx atomic.Int64
+	Offset  int64
+	mu      sync.Mutex // serializes save()
+}
+
+// resumeSnapshot is the on-disk JSON form.
+type resumeSnapshot struct {
 	NextIdx int64 `json:"next_idx"`
 	Offset  int64 `json:"offset"`
-	mu      sync.Mutex
 }
 
 func statePath(outPath string) string { return outPath + ".m314dl-state" }
@@ -142,14 +166,19 @@ func statePath(outPath string) string { return outPath + ".m314dl-state" }
 func openOutput(outPath string) (*resumeState, *os.File, error) {
 	st := &resumeState{}
 	if b, err := os.ReadFile(statePath(outPath)); err == nil {
-		json.Unmarshal(b, st)
+		var snap resumeSnapshot
+		if json.Unmarshal(b, &snap) == nil {
+			st.NextIdx.Store(snap.NextIdx)
+			st.Offset = snap.Offset
+		}
 	}
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, nil, err
 	}
 	if fi, err := f.Stat(); err == nil && fi.Size() < st.Offset {
-		st.NextIdx, st.Offset = 0, 0 // state file lies; start over
+		st.NextIdx.Store(0) // state file lies; start over
+		st.Offset = 0
 	}
 	if err := f.Truncate(st.Offset); err != nil {
 		return nil, nil, err
@@ -163,7 +192,7 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 func (s *resumeState) save(outPath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, _ := json.Marshal(s)
+	b, _ := json.Marshal(resumeSnapshot{NextIdx: s.NextIdx.Load(), Offset: s.Offset})
 	os.WriteFile(statePath(outPath), b, 0o644)
 }
 
@@ -179,7 +208,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	}
 
 	emit := func(it item) bool {
-		if it.idx < state.NextIdx {
+		if it.idx < state.NextIdx.Load() {
 			return true // already written in a previous run
 		}
 		select {
@@ -225,7 +254,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		return fresh, true
 	}
 
-	if st.Live && refresh != nil && !cfg.FromStart && state.NextIdx == 0 {
+	if st.Live && refresh != nil && !cfg.FromStart && state.NextIdx.Load() == 0 {
 		// start at the live edge: mark the DVR backlog seen, keep last 3
 		keep := 3
 		if n := len(st.Segments); n > keep {
@@ -310,9 +339,22 @@ type result struct {
 	url  string
 }
 
-func worker(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, items <-chan item, results chan<- result) {
+func worker(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, ctl *controller, items <-chan item, results chan<- result) {
 	for it := range items {
+		if ctl != nil {
+			if err := ctl.lim.acquire(ctx); err != nil {
+				return
+			}
+		}
 		data, err := fetchItem(ctx, cfg, kc, dec, it)
+		if ctl != nil {
+			ctl.lim.release()
+			if err != nil {
+				ctl.addErr()
+			} else {
+				ctl.addBytes(len(data))
+			}
+		}
 		select {
 		case results <- result{idx: it.idx, data: data, err: err, url: it.url}:
 		case <-ctx.Done():
@@ -483,22 +525,23 @@ func writer(cfg Config, live bool, out *os.File, outPath string, state *resumeSt
 		}
 		pending[r.idx] = r.data
 		for {
-			data, ok := pending[state.NextIdx]
+			idx := state.NextIdx.Load()
+			data, ok := pending[idx]
 			if !ok {
 				break
 			}
-			delete(pending, state.NextIdx)
+			delete(pending, idx)
 			if data != nil {
 				if _, err := out.Write(data); err != nil {
 					return err
 				}
 				state.Offset += int64(len(data))
 			}
-			state.NextIdx++
+			next := state.NextIdx.Add(1)
 			if cfg.Progress != nil {
 				cfg.Progress.AddDone(1)
 			}
-			if state.NextIdx%20 == 0 {
+			if next%20 == 0 {
 				out.Sync()
 				state.save(outPath)
 			}

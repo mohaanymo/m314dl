@@ -1,0 +1,176 @@
+package engine
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Adaptive concurrency bounds. Segment download is network-I/O-bound, so these
+// are counts of in-flight requests, not CPU threads. The controller ramps
+// between min and max to find the point where more parallelism stops helping —
+// without a user-supplied -t and without hammering rate-limited servers.
+const (
+	adaptiveMin   = 4
+	adaptiveStart = 16
+	adaptiveMax   = 64
+)
+
+// limiter is a resizable concurrency gate. Workers acquire before a fetch and
+// release after; the controller resizes the ceiling live. Unlike a fixed
+// semaphore, setLimit can shrink below the current in-flight count — new
+// acquires then block until enough release.
+type limiter struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	limit    int
+	inflight int
+	closed   bool
+}
+
+func newLimiter(n int) *limiter {
+	l := &limiter{limit: n}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+// acquire blocks until an in-flight slot is free or ctx is done.
+func (l *limiter) acquire(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for l.inflight >= l.limit && !l.closed {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		l.cond.Wait()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	l.inflight++
+	return nil
+}
+
+func (l *limiter) release() {
+	l.mu.Lock()
+	l.inflight--
+	l.cond.Signal()
+	l.mu.Unlock()
+}
+
+func (l *limiter) setLimit(n int) {
+	l.mu.Lock()
+	if n > l.limit {
+		l.cond.Broadcast() // wake waiters that can now proceed
+	}
+	l.limit = n
+	l.mu.Unlock()
+}
+
+func (l *limiter) getLimit() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.limit
+}
+
+// unblock wakes every waiter so they re-check ctx; called on cancellation.
+func (l *limiter) unblock() {
+	l.mu.Lock()
+	l.closed = true
+	l.cond.Broadcast()
+	l.mu.Unlock()
+}
+
+// controller drives a limiter via AIMD on measured throughput. Workers report
+// bytes and hard errors; the control loop samples them each tick.
+type controller struct {
+	lim   *limiter
+	bytes atomic.Int64
+	errs  atomic.Int64
+}
+
+func newController() *controller { return &controller{lim: newLimiter(adaptiveStart)} }
+
+func (c *controller) addBytes(n int) { c.bytes.Add(int64(n)) }
+func (c *controller) addErr()        { c.errs.Add(1) }
+
+// ctlState is the control loop's carried state, split out so the decision is a
+// pure, testable function.
+type ctlState struct {
+	slowStart bool
+	cooldown  int
+	prevTP    float64
+}
+
+// decide returns the next limit and state from the current limit, this tick's
+// throughput (bytes) and error count. Slow-start doubles while throughput keeps
+// climbing; then additive-increase / multiplicative-decrease keeps it near the
+// point of diminishing returns; any hard error halves and cools down.
+func decide(limit int, tp float64, errs int64, s ctlState) (int, ctlState) {
+	step := limit / 8
+	if step < 1 {
+		step = 1
+	}
+	switch {
+	case errs > 0:
+		limit = maxInt(adaptiveMin, limit/2)
+		s.slowStart = false
+		s.cooldown = 2
+	case s.cooldown > 0:
+		s.cooldown--
+	case s.slowStart:
+		if tp > s.prevTP*1.05 {
+			limit = minInt(adaptiveMax, limit*2)
+		} else {
+			s.slowStart = false
+		}
+	case tp > s.prevTP*1.10:
+		limit = minInt(adaptiveMax, limit+step)
+	case tp < s.prevTP*0.90:
+		limit = maxInt(adaptiveMin, limit-step)
+	}
+	s.prevTP = tp
+	return limit, s
+}
+
+// run is the control loop; it exits when ctx is cancelled.
+func (c *controller) run(ctx context.Context, verbose func(string, ...any)) {
+	const tick = 500 * time.Millisecond
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	s := ctlState{slowStart: true}
+	var lastBytes int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		total := c.bytes.Load()
+		tp := float64(total - lastBytes)
+		lastBytes = total
+		errs := c.errs.Swap(0)
+		cur := c.lim.getLimit()
+		next, ns := decide(cur, tp, errs, s)
+		s = ns
+		if next != cur {
+			c.lim.setLimit(next)
+			verbose("adaptive: concurrency %d→%d (%.1f MiB/s, %d errs)", cur, next, tp/(1<<20), errs)
+		}
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

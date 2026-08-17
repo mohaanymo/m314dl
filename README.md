@@ -19,24 +19,27 @@ m314dl -key KID:KEY -o out.mp4 https://example.com/video.mpd # download + decryp
 ## Benchmarks
 
 Wall-clock to download **+ decrypt + mux** a 5-minute 1080p stream (~150 MB, 75
-segments), served from localhost with a simulated 50 ms CDN round-trip, 16
-threads, best-of-4. Lower is better; every output was validated with `ffprobe`.
+segments/track), served from localhost with a simulated 50 ms CDN round-trip,
+best-of-3, all outputs verified full-length (155 MB). Lower is better.
 
 | Case | **m314dl** | vsd 0.5.0 | N_m3u8DL-RE 0.6.0 |
 |---|---|---|---|
-| HLS TS (VOD) | **1.30 s** | 2.19 s | 1.37 s |
-| HLS fMP4 (VOD) | **1.33 s** | 2.23 s | 1.40 s |
-| DASH clear (VOD) | **1.32 s** | 2.68 s | 1.82 s |
-| DASH CENC — AES-CTR | **1.39 s** | 2.91 s | 3.26 s |
-| DASH cbcs — AES-CBC pattern | **1.39 s** | 2.91 s | 2.25 s |
+| HLS TS (VOD) | **0.95 s** | 1.60 s | 1.12 s |
+| HLS fMP4 (VOD) | **0.96 s** | 1.62 s | 1.08 s |
+| DASH clear (VOD) | **0.91 s** | 1.85 s | 1.45 s |
+| DASH CENC — AES-CTR | **0.98 s** | 1.95 s | 2.69 s |
+| DASH cbcs — AES-CBC pattern | **0.99 s** | 1.88 s | 1.82 s |
 
-Two things to notice:
+Three things to notice:
 
 - **m314dl is flat.** Encryption adds ~0.07 s, because segments are decrypted
   in memory *as they download* — the decrypt overlaps the next fetch and never
-  touches disk. Competitors pay 1–2 s for the same content because they decrypt
-  in a separate pass (N_m3u8DL-RE shells out to `mp4decrypt` after the merge;
-  see below), or download streams strictly one at a time (vsd).
+  touches disk. Competitors pay ~1 s or more for the same content because they
+  decrypt in a separate pass (N_m3u8DL-RE shells out to `mp4decrypt` after the
+  merge; see below), or download streams strictly one at a time (vsd).
+- **Concurrency auto-tunes.** With no `-t` flag, m314dl ramps its in-flight
+  request count to fit the network (AIMD, 4→64) and backs off from rate-limited
+  servers — hiding round-trip time without a knob to guess. `-t N` pins it.
 - **The numbers are reproducible.** The corpus generator, the throttling
   server, and the exact commands live in [`bench/`](bench/). Re-run them on your
   own hardware — don't trust a copied table.
@@ -78,6 +81,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **DASH**: SegmentTemplate (`$Number$`/`$Time$` + `%0Nd`), SegmentTimeline (negative `@r`), SegmentList, SegmentBase, multi-period (merged with discontinuity markers), namespace-agnostic lenient XML, `cenc:default_KID`
 - **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools
 - **Live recording** for both protocols: starts at the live edge (`-live-from-start` for the whole DVR window), refresh failures retried forever, segment dedupe across refreshes, `-live-duration` limit, **Ctrl-C finishes the recording gracefully and muxes** — you never lose what you already recorded
+- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx — no thread count to guess, and no hammering rate-limited CDNs; `-t N` pins a fixed count
 - **One download pipeline** for VOD and live (feeder → worker pool → ordered writer): no duplicated code paths, no fd-per-segment merge ("too many open files" is structurally impossible — output is a single streaming append)
 - **Resume**: interrupted VOD downloads continue exactly where they stopped (byte-exact; a failed segment can never be silently skipped)
 - **Retries with exponential backoff + jitter** that cover mid-body read failures, not just connection setup; status-aware (404 fails fast, 5xx/429 retry)
