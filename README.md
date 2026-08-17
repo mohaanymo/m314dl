@@ -171,16 +171,6 @@ at the live edge; press Ctrl-C anytime and the file is still finalized and muxed
 On the reproducible benchmark above, yes — across HLS, DASH and encrypted
 content. See [`bench/`](bench/) to run it yourself.
 
-## Topics
-
-`hls` · `dash` · `m3u8` · `mpd` · `m3u8-downloader` · `dash-downloader` ·
-`video-downloader` · `stream-downloader` · `cenc` · `cbcs` · `widevine` · `drm`
-· `decryption` · `mp4decrypt-alternative` · `cmaf` · `aes-128` · `live-stream` ·
-`subtitles` · `golang` · `ffmpeg`
-
-> Add these as repository **Topics** in the GitHub sidebar (⚙ next to *About*)
-> so the repo surfaces for these searches.
-
 ## Tests
 
 ```sh
