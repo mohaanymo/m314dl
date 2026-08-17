@@ -127,3 +127,21 @@ func TestDRMRefused(t *testing.T) {
 		t.Fatalf("want DRM refusal, got %v", err)
 	}
 }
+
+func TestTempStreamPathIsolation(t *testing.T) {
+	st := &manifest.Stream{Type: manifest.Video, ID: "video=3000000"}
+	// two episodes in the same season directory, same manifest stream id
+	a := TempStreamPath("/lib/Show/Season 01/E01.mkv", st, ".mp4")
+	b := TempStreamPath("/lib/Show/Season 01/E02.mkv", st, ".mp4")
+	if a == b {
+		t.Fatalf("concurrent episodes must not share a temp path: both %q", a)
+	}
+	// stable across reruns of the same command (resume relies on this)
+	if a2 := TempStreamPath("/lib/Show/Season 01/E01.mkv", st, ".mp4"); a2 != a {
+		t.Fatalf("temp path not stable: %q vs %q", a, a2)
+	}
+	// lives beside the output, not in some scratch dir
+	if got := filepath.Dir(a); got != "/lib/Show/Season 01" {
+		t.Fatalf("temp not beside output: %q", got)
+	}
+}

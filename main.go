@@ -268,7 +268,7 @@ func run() error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(4) // concurrent streams; threads apply within each
 	for _, st := range selected {
-		results = append(results, done{st: st, path: engine.TempStreamPath(workDir, st, rawExt(st))})
+		results = append(results, done{st: st, path: engine.TempStreamPath(outPath, st, rawExt(st))})
 	}
 	for i := range results {
 		r := &results[i]

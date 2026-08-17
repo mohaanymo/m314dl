@@ -627,9 +627,16 @@ func downloadSingleFile(ctx context.Context, cfg Config, st *manifest.Stream, ou
 	return nil
 }
 
-// TempStreamPath returns the raw per-stream temp file path inside dir.
-func TempStreamPath(dir string, st *manifest.Stream, ext string) string {
-	name := fmt.Sprintf("m314dl-%s-%s%s", st.Type, sanitize(st.ID), ext)
+// TempStreamPath returns the raw per-stream temp file path. The name is
+// derived from the OUTPUT file, not just the stream id, so two concurrent
+// downloads that share an output directory but write different files (e.g. two
+// episodes of one series whose manifests reuse stream ids like "video=3000000"
+// or "1") never collide on the same temp file. The path is stable across reruns
+// of the same command, so resume still works.
+func TempStreamPath(outPath string, st *manifest.Stream, ext string) string {
+	dir := filepath.Dir(outPath)
+	outBase := filepath.Base(strings.TrimSuffix(outPath, filepath.Ext(outPath)))
+	name := fmt.Sprintf("%s.m314dl-%s-%s%s", outBase, st.Type, sanitize(st.ID), ext)
 	return filepath.Join(dir, name)
 }
 
