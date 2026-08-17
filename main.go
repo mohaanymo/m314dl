@@ -57,9 +57,10 @@ type options struct {
 	keepTemp      bool
 	subFormat     string
 	subExternal   bool
-	verbose       bool
-	timeout       time.Duration
-	keys          multiFlag
+	verbose          bool
+	timeout          time.Duration
+	progressInterval time.Duration
+	keys             multiFlag
 }
 
 func main() {
@@ -92,6 +93,7 @@ func run() error {
 	flag.BoolVar(&o.subExternal, "sub-external", false, "write subtitles as sidecar files next to the output instead of muxing them in")
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
 	flag.DurationVar(&o.timeout, "timeout", 0, "per-request timeout (default none; retries handle stalls)")
+	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
@@ -250,7 +252,7 @@ func run() error {
 		os.Exit(130)
 	}()
 
-	prog := engine.NewProgress(live)
+	prog := engine.NewProgress(live, o.progressInterval)
 	progStop := make(chan struct{})
 	go prog.Render(progStop)
 

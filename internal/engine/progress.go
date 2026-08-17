@@ -18,10 +18,11 @@ type Progress struct {
 	bytes      atomic.Int64
 	knownBytes atomic.Int64
 
-	mu      sync.Mutex
-	samples []sample // ring of (time, bytes) for windowed speed
-	live    bool
-	start   time.Time
+	mu       sync.Mutex
+	samples  []sample      // ring of (time, bytes) for windowed speed
+	live     bool
+	start    time.Time
+	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)
 }
 
 type sample struct {
@@ -29,8 +30,10 @@ type sample struct {
 	b int64
 }
 
-func NewProgress(live bool) *Progress {
-	return &Progress{live: live, start: time.Now()}
+// NewProgress creates a progress aggregator. interval overrides the render
+// cadence for both the TTY and piped branches; 0 keeps the defaults.
+func NewProgress(live bool, interval time.Duration) *Progress {
+	return &Progress{live: live, start: time.Now(), interval: interval}
 }
 
 func (p *Progress) AddTotal(n int64)      { p.total.Add(n) }
@@ -102,13 +105,20 @@ func (p *Progress) Line() string {
 }
 
 // Render prints progress to stderr until stop is closed. On a TTY it rewrites
-// one line; otherwise it prints a plain line every 5s (machine-parseable,
-// survives redirection — no ANSI garbage).
+// one line; otherwise it prints a plain line each interval (machine-parseable,
+// survives redirection — no ANSI garbage). Default cadence is 1s on a TTY and
+// 5s when piped, overridable via NewProgress's interval.
 func (p *Progress) Render(stop <-chan struct{}) {
 	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
 	interval := time.Second
 	if !isTTY {
 		interval = 5 * time.Second
+	}
+	if p.interval > 0 {
+		interval = p.interval
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond // floor: don't flood the consumer
+		}
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
