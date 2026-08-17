@@ -292,7 +292,9 @@ func run() error {
 
 	// subtitles: normalize raw payloads into srt/vtt
 	var muxInputs []mux.Input
-	subSidecars := map[string]bool{} // -sub-external: paths already used
+	var sidecars []string             // -sub-external: files written beside output
+	wentExternal := map[string]bool{} // raw paths whose subtitle became a sidecar
+	subSidecars := map[string]bool{}  // sidecar paths already used (collision guard)
 	for _, r := range results {
 		if r.st.Type != manifest.Subtitles {
 			muxInputs = append(muxInputs, mux.Input{
@@ -313,6 +315,11 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "warning: could not place sidecar subtitle (%v); keeping %s\n", err, subPath)
 				continue
 			}
+			sidecars = append(sidecars, sidecar)
+			wentExternal[r.path] = true
+			if !o.keepTemp {
+				os.Remove(r.path) // raw payload superseded by the sidecar
+			}
 			fmt.Fprintln(os.Stderr, "subtitle: "+sidecar)
 			continue
 		}
@@ -325,8 +332,23 @@ func run() error {
 	if o.noMux {
 		fmt.Fprintln(os.Stderr, "done (raw streams kept):")
 		for _, r := range results {
-			fmt.Fprintln(os.Stderr, "  "+r.path)
+			if !wentExternal[r.path] {
+				fmt.Fprintln(os.Stderr, "  "+r.path)
+			}
 		}
+		for _, s := range sidecars {
+			fmt.Fprintln(os.Stderr, "  "+s)
+		}
+		return nil
+	}
+
+	// Nothing to mux (e.g. subtitles-only with -sub-external): the sidecars are
+	// already written, so finish without invoking ffmpeg.
+	if len(muxInputs) == 0 {
+		if len(sidecars) == 0 {
+			return fmt.Errorf("no streams selected to write")
+		}
+		fmt.Fprintln(os.Stderr, "done (subtitles only)")
 		return nil
 	}
 
