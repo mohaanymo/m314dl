@@ -85,7 +85,8 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **One download pipeline** for VOD and live (feeder → worker pool → ordered writer): no duplicated code paths, no fd-per-segment merge ("too many open files" is structurally impossible — output is a single streaming append)
 - **Resume**: interrupted VOD downloads continue exactly where they stopped (byte-exact; a failed segment can never be silently skipped)
 - **Retries with exponential backoff + jitter** that cover mid-body read failures, not just connection setup; status-aware (404 fails fast, 5xx/429 retry)
-- **Subtitles**: WebVTT (concatenated segments deduped), TTML→SRT (lenient regex parsing — survives non-compliant XML), stpp-in-fMP4 extracted natively (no ffmpeg TTML gap), muxed with correct ISO 639-2 language tags
+- **Subtitles**: WebVTT (concatenated segments deduped), TTML→SRT (lenient regex parsing — survives non-compliant XML), stpp-in-fMP4 extracted natively (no ffmpeg TTML gap), muxed with correct ISO 639-2 language tags — or written as sidecar files with `-sub-external`
+- **Flexible input**: an HTTP(S) URL (first *or* last argument), a local `.m3u8`/`.mpd` file or `file://` path (for manifests signed per request and never published), or a web page to scrape
 - **Page scraping**: point it at a web page; it finds `.m3u8`/`.mpd` URLs (inline JSON and one iframe level included)
 - **Automation-friendly**: plain-line progress on non-TTY (no ANSI garbage in logs), real exit codes, quiet machine-readable output
 - Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth, HTTP/2
@@ -138,11 +139,23 @@ Run `m314dl -h` for all flags.
 |---|---|
 | `best`, `worst`, `all`, `best3` | positional over sorted streams |
 | `key=regex[:key=regex...]` | filter; keeps **all** matches |
+| `key!=regex` | negate — keep streams that do **not** match (RE2 has no negative lookahead, so this is how you express a deny-list) |
 | `...:for=bestN` | take N best from the filtered set |
 | `none` | drop this type |
 
-Keys: `id`, `lang`, `name`, `codecs`, `res`, `channel`, `bwmin` (kbps), `bwmax`.
+Regex keys: `id`, `lang`, `name`, `codecs`, `res`, `range`, `channel`.
+Numeric keys: `bwmin`/`bwmax` (kbps), `segsmin`/`segsmax` (segment count),
+`plistdurmin`/`plistdurmax` (seconds, or `20m`). Numeric filters treat an
+unknown value as passing, so `segsmin`/`plistdurmin` drop short ad/bumper
+periods in DASH without touching HLS tracks whose length isn't known yet.
 Sorting: video by height→bandwidth, audio by default-flag→channels→bandwidth.
+
+```sh
+# drop 1-segment SSAI bumpers, keep ≥720p AVC content
+m314dl -sv 'segsmin=2:plistdurmin=20m:res=x720$:codecs=avc1|avc3:for=best' URL
+# drop two mislabeled subtitle tracks by id (deny-list via negation)
+m314dl -ss 'id!=^(a|b)$:for=all' URL
+```
 
 ## FAQ
 

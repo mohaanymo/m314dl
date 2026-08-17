@@ -56,6 +56,7 @@ type options struct {
 	noMux         bool
 	keepTemp      bool
 	subFormat     string
+	subExternal   bool
 	verbose       bool
 	timeout       time.Duration
 	keys          multiFlag
@@ -88,6 +89,7 @@ func run() error {
 	flag.BoolVar(&o.keepTemp, "keep", false, "keep temp stream files after mux")
 	flag.Var(&o.keys, "key", "CENC content key 'KID:KEY' (hex; KID dashes optional) or bare 'KEY' (repeatable). Enables native in-process DRM decryption — no mp4decrypt needed")
 	flag.StringVar(&o.subFormat, "sub-format", "srt", "subtitle output: srt or vtt")
+	flag.BoolVar(&o.subExternal, "sub-external", false, "write subtitles as sidecar files next to the output instead of muxing them in")
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
 	flag.DurationVar(&o.timeout, "timeout", 0, "per-request timeout (default none; retries handle stalls)")
 	showVersion := flag.Bool("version", false, "print version")
@@ -95,7 +97,14 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
 		flag.PrintDefaults()
 	}
-	flag.Parse()
+	// Accept the input as the first arg (N_m3u8DL-RE style) as well as last:
+	// Go's flag package stops at the first non-flag, so rotate a leading
+	// non-flag token to the end before parsing.
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		args = append(append([]string{}, args[1:]...), args[0])
+	}
+	flag.CommandLine.Parse(args)
 	if *showVersion {
 		fmt.Println("m314dl", version)
 		return nil
@@ -283,6 +292,7 @@ func run() error {
 
 	// subtitles: normalize raw payloads into srt/vtt
 	var muxInputs []mux.Input
+	subSidecars := map[string]bool{} // -sub-external: paths already used
 	for _, r := range results {
 		if r.st.Type != manifest.Subtitles {
 			muxInputs = append(muxInputs, mux.Input{
@@ -294,6 +304,16 @@ func run() error {
 		subPath, err := convertSubtitle(r.path, o.subFormat, ffmpeg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: subtitle %s conversion failed (%v); keeping raw file %s\n", r.st.ID, err, r.path)
+			continue
+		}
+		if o.subExternal {
+			sidecar := sidecarSubPath(outPath, r.st, o.subFormat, subSidecars)
+			subSidecars[sidecar] = true
+			if err := os.Rename(subPath, sidecar); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not place sidecar subtitle (%v); keeping %s\n", err, subPath)
+				continue
+			}
+			fmt.Fprintln(os.Stderr, "subtitle: "+sidecar)
 			continue
 		}
 		muxInputs = append(muxInputs, mux.Input{
@@ -324,6 +344,55 @@ func run() error {
 	}
 	fmt.Fprintln(os.Stderr, "done: "+outPath)
 	return nil
+}
+
+// sidecarSubPath builds "<output-basename>.<lang>.<fmt>" next to the output,
+// disambiguating with the stream name/ID when a language repeats.
+func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map[string]bool) string {
+	base := strings.TrimSuffix(outPath, filepath.Ext(outPath))
+	tag := st.Language
+	if tag == "" {
+		tag = "sub"
+	}
+	cand := fmt.Sprintf("%s.%s.%s", base, tag, format)
+	if used[cand] {
+		extra := st.Name
+		if extra == "" {
+			extra = st.ID
+		}
+		cand = fmt.Sprintf("%s.%s.%s.%s", base, tag, sanitizeTag(extra), format)
+	}
+	return cand
+}
+
+var tagBad = regexp.MustCompile(`[^\w.\-]+`)
+
+func sanitizeTag(s string) string { return tagBad.ReplaceAllString(s, "_") }
+
+// localManifestPath returns the filesystem path when input is a local manifest
+// (a file:// URL, or a schemeless string that names an existing file) and ok.
+func localManifestPath(input string) (string, bool) {
+	if strings.HasPrefix(input, "file://") {
+		return strings.TrimPrefix(input, "file://"), true
+	}
+	if u, err := url.Parse(input); err == nil && u.Scheme != "" {
+		return "", false // has a real URL scheme (http/https/…)
+	}
+	if _, err := os.Stat(input); err == nil {
+		return input, true
+	}
+	return "", false
+}
+
+// localBaseURL is the base against which relative segment URLs in a local
+// manifest resolve. Absolute segment URLs (the common case for signed
+// manifests) ignore it.
+func localBaseURL(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return "file://" + filepath.Dir(abs) + "/"
 }
 
 // parseKeys parses -key values into a KID→key map. Each value is "KID:KEY"
@@ -359,6 +428,25 @@ func parseKeys(vals []string) (map[[16]byte][]byte, error) {
 // loadManifest fetches the input, sniffs HLS/DASH, and falls back to
 // scraping when the input is a web page.
 func loadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
+	// Local manifest file (path or file://): some providers sign the playlist
+	// per request and hand it over as text rather than a URL.
+	if path, ok := localManifestPath(inputURL); ok {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read manifest %s: %w", path, err)
+		}
+		base := localBaseURL(path)
+		logv("local manifest %s (base %s)", path, base)
+		switch {
+		case hls.IsHLS(body):
+			m, err := hls.ParseMaster(body, base)
+			return m, "hls", err
+		case dash.IsDASH(body):
+			m, err := dash.Parse(body, base)
+			return m, "dash", err
+		}
+		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH manifest", path)
+	}
 	body, finalURL, err := client.FetchBytes(ctx, inputURL, "")
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)

@@ -165,3 +165,42 @@ func TestISODuration(t *testing.T) {
 		t.Fatalf("d = %v", d)
 	}
 }
+
+// mpdAdPeriod: period 2 reuses id "v1" but re-encodes at a different resolution
+// (an SSAI ad / bumper), which must NOT be spliced into the content track.
+const mpdAdPeriod = `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT13S">
+ <Period duration="PT10S">
+  <AdaptationSet mimeType="video/mp4">
+   <SegmentTemplate media="c-$Number$.m4s" timescale="1" duration="5" startNumber="1"/>
+   <Representation id="v1" bandwidth="1000" width="640" height="360"/>
+  </AdaptationSet>
+ </Period>
+ <Period duration="PT3S">
+  <AdaptationSet mimeType="video/mp4">
+   <SegmentTemplate media="ad-$Number$.m4s" timescale="1" duration="3" startNumber="1"/>
+   <Representation id="v1" bandwidth="1000" width="1280" height="720"/>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+
+func TestMultiPeriodAdNotMerged(t *testing.T) {
+	m, err := Parse([]byte(mpdAdPeriod), "https://ex.com/x.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Streams) != 2 {
+		t.Fatalf("incompatible ad period should be a separate track: got %d streams, want 2", len(m.Streams))
+	}
+	// content track keeps its 2 segments, no ad spliced in
+	if n := len(m.Streams[0].Segments); n != 2 {
+		t.Fatalf("content track segs = %d, want 2 (no ad spliced)", n)
+	}
+	// the ad track is distinct and filterable (1 short segment)
+	if n := len(m.Streams[1].Segments); n != 1 {
+		t.Fatalf("ad track segs = %d, want 1", n)
+	}
+	if m.Streams[0].ID == m.Streams[1].ID {
+		t.Fatal("ad track must have a distinct ID")
+	}
+}

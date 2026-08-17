@@ -174,8 +174,7 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				if err != nil {
 					return nil, err
 				}
-				encrypted := len(rep.ContentProtection) > 0 || len(as.ContentProtection) > 0
-				if encrypted {
+				if len(rep.ContentProtection) > 0 || len(as.ContentProtection) > 0 {
 					kid := defaultKID(rep.ContentProtection, as.ContentProtection)
 					for i := range segs {
 						segs[i].Key = &manifest.Key{Method: manifest.EncCENC, KID: kid}
@@ -183,16 +182,26 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				}
 				key := st.ID
 				if prev, ok := byKey[key]; ok {
-					// multi-period continuation: append with discontinuity marker
-					if len(segs) > 0 {
+					// Same track ID recurs across periods. Concatenate (with a
+					// discontinuity) ONLY when the encoding is truly continuous:
+					// same codecs, resolution, init segment and content key.
+					// Ad/bumper periods (SSAI) and per-period re-encodes differ
+					// on at least one of those, so keep them as separate tracks
+					// the caller can drop (e.g. -sv segsMin=2:plistDurMin=20m)
+					// rather than splicing ads in or dropping a period's init.
+					if len(segs) > 0 && mergeCompatible(prev, st, init, firstSegKey(segs)) {
 						segs[0].Discontinuity = true
 						base := int64(len(prev.Segments))
 						for i := range segs {
 							segs[i].Seq = base + int64(i)
 						}
 						prev.Segments = append(prev.Segments, segs...)
+						continue
 					}
-					continue
+					// incompatible: give it a period-unique ID so it is a
+					// distinct, filterable track instead of colliding.
+					st.ID = fmt.Sprintf("%s.p%d", st.ID, pi)
+					key = st.ID
 				}
 				st.Init = init
 				st.Segments = segs
@@ -520,6 +529,45 @@ func parseFrameRate(s string) float64 {
 	}
 	v, _ := strconv.ParseFloat(s, 64)
 	return v
+}
+
+// mergeCompatible reports whether cur (a later period with the same track ID)
+// is a true continuation of prev — same codecs, resolution, init segment and
+// content key — so their segments can be concatenated into one track. Anything
+// else (SSAI ad periods, per-period re-encodes, per-period KIDs) is not merged.
+func mergeCompatible(prev, cur *manifest.Stream, curInit *manifest.InitMap, curKey *manifest.Key) bool {
+	if prev.Codecs != cur.Codecs || prev.Width != cur.Width || prev.Height != cur.Height {
+		return false
+	}
+	if !sameInit(prev.Init, curInit) {
+		return false
+	}
+	var prevKey *manifest.Key
+	if len(prev.Segments) > 0 {
+		prevKey = prev.Segments[0].Key
+	}
+	return sameKey(prevKey, curKey)
+}
+
+func sameInit(a, b *manifest.InitMap) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || a.URL == b.URL
+}
+
+func sameKey(a, b *manifest.Key) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || (a.Method == b.Method && a.KID == b.KID)
+}
+
+func firstSegKey(segs []manifest.Segment) *manifest.Key {
+	if len(segs) > 0 {
+		return segs[0].Key
+	}
+	return nil
 }
 
 // defaultKID extracts the cenc:default_KID from ContentProtection descriptors
