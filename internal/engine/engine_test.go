@@ -251,3 +251,46 @@ func TestIntraSegmentResume(t *testing.T) {
 		t.Fatal("seg0 should not be range-requested")
 	}
 }
+
+// TestProgressTotalUpfront proves the segment total is published before
+// downloads complete, so the percentage denominator is final from the first
+// tick instead of inflating as segments trickle out (which slid the bar back).
+func TestProgressTotalUpfront(t *testing.T) {
+	gate := make(chan struct{})
+	reached := make(chan struct{}, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached <- struct{}{}
+		<-gate // hold every segment until the test releases
+		fmt.Fprintf(w, "[%s]", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	st := &manifest.Stream{ID: "t", Type: manifest.Video}
+	for i := 0; i < 5; i++ {
+		st.Segments = append(st.Segments, manifest.Segment{
+			URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: 1,
+		})
+	}
+	out := filepath.Join(t.TempDir(), "out.ts")
+	prog := NewProgress(false, 0)
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	done := make(chan error, 1)
+	go func() {
+		done <- DownloadStream(context.Background(), Config{Client: client, Threads: 2, Progress: prog}, st, out, nil)
+	}()
+
+	<-reached // a worker is fetching, so feed has already published the total
+	if tot := prog.total.Load(); tot != 5 {
+		t.Fatalf("total = %d before any segment completed, want 5 upfront", tot)
+	}
+	if d := prog.done.Load(); d != 0 {
+		t.Fatalf("done = %d while segments are blocked, want 0", d)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if prog.total.Load() != 5 || prog.done.Load() != 5 {
+		t.Fatalf("final total/done = %d/%d, want 5/5", prog.total.Load(), prog.done.Load())
+	}
+}

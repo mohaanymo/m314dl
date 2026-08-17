@@ -230,7 +230,14 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	}
 
 	push := func(cur *manifest.Stream) (int, bool) {
+		// Build the whole batch first (a cheap in-memory walk), publish the
+		// total, then emit. Emitting blocks on the worker channel at download
+		// speed, so counting there would inflate the denominator over the run
+		// and slide the percentage backwards. Counting up front makes it final
+		// before the first progress tick. Live grows per refresh, but live shows
+		// elapsed/count, not a percentage, so there is no bar to run backwards.
 		fresh := 0
+		var batch []item
 		for i := range cur.Segments {
 			seg := &cur.Segments[i]
 			key := seg.URL + rangeKey(seg.Range)
@@ -245,20 +252,18 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 			fresh++
 			if init := segInit(seg, cur); init != nil && init.URL != lastInit {
 				lastInit = init.URL
-				if !emit(item{idx: idx, isInit: true, url: init.URL, rng: init.Range}) {
-					return fresh, false
-				}
+				batch = append(batch, item{idx: idx, isInit: true, url: init.URL, rng: init.Range})
 				idx++
-				if cfg.Progress != nil {
-					cfg.Progress.AddTotal(1)
-				}
 			}
-			if !emit(item{idx: idx, seg: seg, url: seg.URL, rng: seg.Range, key: seg.Key, seq: seg.Seq}) {
-				return fresh, false
-			}
+			batch = append(batch, item{idx: idx, seg: seg, url: seg.URL, rng: seg.Range, key: seg.Key, seq: seg.Seq})
 			idx++
-			if cfg.Progress != nil {
-				cfg.Progress.AddTotal(1)
+		}
+		if cfg.Progress != nil {
+			cfg.Progress.AddTotal(int64(len(batch)))
+		}
+		for i := range batch {
+			if !emit(batch[i]) {
+				return fresh, false
 			}
 		}
 		return fresh, true
