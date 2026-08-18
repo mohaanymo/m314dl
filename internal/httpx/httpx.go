@@ -38,10 +38,28 @@ type Client struct {
 func New(o Options) (*Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxConnsPerHost = 0
-	tr.MaxIdleConnsPerHost = 64
-	tr.ForceAttemptHTTP2 = true
-	if o.Insecure {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	// Keep many connections warm in the idle pool so sustained high concurrency
+	// reuses TCP+TLS instead of re-handshaking per segment. Sized well above the
+	// usual -t so several concurrent streams (video+audio+subs) don't churn.
+	tr.MaxIdleConns = 512
+	tr.MaxIdleConnsPerHost = 256
+	// Deliberately DO NOT use HTTP/2. A CDN that offers h2 makes Go pool every
+	// concurrent segment request onto ONE TCP connection (h2 multiplexing). One
+	// TCP flow is throughput-limited by RTT and packet loss (≈ MSS/(RTT·√loss)),
+	// so on a real CDN it can't fill the pipe — invisible on localhost (RTT≈0),
+	// crippling over the network. HTTP/1.1 opens one connection per in-flight
+	// request instead, giving N independent flows (what N_m3u8DL/aria2/yt-dlp do)
+	// and ~N× the aggregate throughput.
+	//
+	// Disabling h2 takes BOTH steps: empty (non-nil) TLSNextProto stops Go's
+	// automatic h2 upgrade, AND the ALPN offer must advertise only http/1.1 —
+	// otherwise the server still selects h2 over TLS and answers a request Go
+	// parses as HTTP/1.1 with HTTP/2 frames ("malformed HTTP response \x00\x00..").
+	tr.ForceAttemptHTTP2 = false
+	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	tr.TLSClientConfig = &tls.Config{
+		NextProtos:         []string{"http/1.1"},
+		InsecureSkipVerify: o.Insecure,
 	}
 	if o.Proxy != "" {
 		pu, err := url.Parse(o.Proxy)

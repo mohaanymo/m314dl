@@ -105,10 +105,13 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	// still ramps up to it and backs off below it on rate-limit pressure. With no
 	// -t the ceiling is adaptiveMax.
 	ceiling := cfg.Threads
-	if ceiling <= 0 {
+	var ctl *controller
+	if ceiling > 0 {
+		ctl = newFixedController(ceiling) // user pinned -t: hold it, don't ramp/sawtooth
+	} else {
 		ceiling = adaptiveMax
+		ctl = newController(ceiling) // no -t: auto-tune up to adaptiveMax
 	}
-	ctl := newController(ceiling)
 	go ctl.run(ctx, cfg.Verbose)
 	go func() { <-ctx.Done(); ctl.lim.unblock() }()
 	workers := ceiling

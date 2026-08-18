@@ -88,6 +88,7 @@ func (l *limiter) unblock() {
 type controller struct {
 	lim        *limiter
 	minC, maxC int
+	fixed      bool // user pinned -t: hold maxC, back off only on real pressure
 	bytes      atomic.Int64
 	errs       atomic.Int64
 	press      atomic.Int64
@@ -109,6 +110,18 @@ func newController(ceiling int) *controller {
 		minC = ceiling
 	}
 	return &controller{lim: newLimiter(start), minC: minC, maxC: ceiling}
+}
+
+// newFixedController honors a user-pinned -t: it starts AT the requested count
+// (not the ramp point) and holds there, unlike the auto-tuner which climbs from
+// adaptiveStart and sawtooths around the point of diminishing returns. Passing
+// -t 60 should mean "use 60", matching N_m3u8DL's --thread-count. Real
+// rate-limit pressure still backs it off (then it climbs straight back).
+func newFixedController(n int) *controller {
+	c := newController(n)
+	c.fixed = true
+	c.lim.setLimit(c.maxC) // start at the pinned count, not adaptiveStart
+	return c
 }
 
 func (c *controller) addBytes(n int)      { c.bytes.Add(int64(n)) }
@@ -154,6 +167,27 @@ func decide(limit int, tp float64, errs int64, minC, maxC int, s ctlState) (int,
 	return limit, s
 }
 
+// decideFixed is the control rule when the user pinned -t: hold maxC, halve on
+// real rate-limit pressure, then climb straight back. No throughput-based
+// reduction, so a plateau (the normal steady state on a real CDN) never drags
+// concurrency below what the user asked for.
+func decideFixed(limit int, errs int64, minC, maxC int, s ctlState) (int, ctlState) {
+	switch {
+	case errs > 0:
+		limit = maxInt(minC, limit/2)
+		s.cooldown = 2
+	case s.cooldown > 0:
+		s.cooldown--
+	case limit < maxC:
+		step := limit / 8
+		if step < 1 {
+			step = 1
+		}
+		limit = minInt(maxC, limit+step)
+	}
+	return limit, s
+}
+
 // run is the control loop; it exits when ctx is cancelled.
 func (c *controller) run(ctx context.Context, verbose func(string, ...any)) {
 	const tick = 500 * time.Millisecond
@@ -173,7 +207,13 @@ func (c *controller) run(ctx context.Context, verbose func(string, ...any)) {
 		// rate-limit pressure counts as backoff pressure alongside hard errors
 		errs := c.errs.Swap(0) + c.press.Swap(0)
 		cur := c.lim.getLimit()
-		next, ns := decide(cur, tp, errs, c.minC, c.maxC, s)
+		var next int
+		var ns ctlState
+		if c.fixed {
+			next, ns = decideFixed(cur, errs, c.minC, c.maxC, s)
+		} else {
+			next, ns = decide(cur, tp, errs, c.minC, c.maxC, s)
+		}
 		s = ns
 		if next != cur {
 			c.lim.setLimit(next)

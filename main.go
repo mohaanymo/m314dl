@@ -73,7 +73,7 @@ func main() {
 func run() error {
 	var o options
 	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4)")
-	flag.IntVar(&o.threads, "t", 0, "max concurrent segment downloads per stream — a ceiling, not a fixed count: the downloader auto-tunes up to it and backs off below on rate limits (default: auto-tune up to 64)")
+	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")

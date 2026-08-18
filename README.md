@@ -40,8 +40,8 @@ Three things to notice:
 - **Concurrency auto-tunes.** With no `-t` flag, m314dl ramps its in-flight
   request count to fit the network (AIMD, 4→64) and backs off from rate-limited
   servers (honoring `Retry-After`) — hiding round-trip time without a knob to
-  guess. `-t N` sets a *ceiling*, not a fixed count: it still auto-tunes up to N
-  and backs off below it under pressure.
+  guess. `-t N` uses exactly N and holds it (matching `--thread-count`), backing
+  off only on real rate-limit pressure, then climbing straight back.
 - **The numbers are reproducible.** The corpus generator, the throttling
   server, and the exact commands live in [`bench/`](bench/). Re-run them on your
   own hardware — don't trust a copied table.
@@ -83,7 +83,8 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **DASH**: SegmentTemplate (`$Number$`/`$Time$` + `%0Nd`), SegmentTimeline (negative `@r`), SegmentList, SegmentBase, multi-period (merged with discontinuity markers), namespace-agnostic lenient XML, `cenc:default_KID`
 - **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools
 - **Live recording** for both protocols: starts at the live edge (`-live-from-start` for the whole DVR window), refresh failures retried forever, segment dedupe across refreshes, `-live-duration` limit, **Ctrl-C finishes the recording gracefully and muxes** — you never lose what you already recorded
-- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx (honoring `Retry-After`) — no thread count to guess, and no hammering rate-limited CDNs; `-t N` sets a ceiling (auto-tunes up to N, still backs off below it)
+- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx (honoring `Retry-After`) — no thread count to guess, and no hammering rate-limited CDNs; `-t N` pins exactly N (held, still backs off on rate limits)
+- **One TCP connection per in-flight request (HTTP/1.1)**: a CDN offering HTTP/2 would make Go multiplex every concurrent segment onto a single TCP connection, and one flow can't fill a real network's pipe (RTT- and loss-bound) — so downloads run over many independent HTTP/1.1 connections, the way `N_m3u8DL-RE`/`aria2`/`yt-dlp` do, for full aggregate throughput
 - **One download pipeline** for VOD and live (feeder → worker pool → ordered writer): no duplicated code paths; segments stream to disk (one part file per in-flight segment, decrypted and appended in order) so peak memory is one segment, not one per thread — even for huge segments
 - **Resume that survives a kill, not just a clean exit**: segments stream to part files with HTTP byte-range resume, and the checkpoint is written on every commit — so an interrupted (or hard-killed, e.g. a TUI where Ctrl-C is a keypress) VOD download continues byte-exact, losing at most the one segment being written. Works even when a whole movie is a handful of tens-of-MB segments; a failed segment is never silently skipped
 - **Retries with exponential backoff + jitter** that cover mid-body read failures, not just connection setup; status-aware (404 fails fast, 5xx/429 retry)
@@ -91,7 +92,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **Flexible input**: an HTTP(S) URL (first *or* last argument), a local `.m3u8`/`.mpd` file or `file://` path (for manifests signed per request and never published), or a web page to scrape
 - **Page scraping**: point it at a web page; it finds `.m3u8`/`.mpd` URLs (inline JSON and one iframe level included)
 - **Automation-friendly**: plain-line progress on non-TTY (no ANSI garbage in logs), real exit codes, quiet machine-readable output
-- Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth, HTTP/2
+- Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth
 
 **Scope of decryption.** m314dl decrypts when you provide the key. It does not
 run a license/CDM handshake, and HLS SAMPLE-AES and HLS-CMAF CENC key parsing
