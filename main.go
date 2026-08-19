@@ -57,6 +57,7 @@ type options struct {
 	keepTemp         bool
 	subFormat        string
 	subExternal      bool
+	ffmpegPath       string
 	verbose          bool
 	timeout          time.Duration
 	progressInterval time.Duration
@@ -88,6 +89,7 @@ func run() error {
 	flag.DurationVar(&o.liveLimit, "live-duration", 0, "stop live recording after this duration (e.g. 1h30m)")
 	flag.BoolVar(&o.liveFromStart, "live-from-start", false, "live: download the whole DVR window instead of starting at the live edge")
 	flag.BoolVar(&o.noMux, "no-mux", false, "keep raw per-stream files, skip ffmpeg")
+	flag.StringVar(&o.ffmpegPath, "ffmpeg", "", "path to the ffmpeg binary (default: next to m314dl, then PATH)")
 	flag.BoolVar(&o.keepTemp, "keep", false, "keep temp stream files after mux")
 	flag.Var(&o.keys, "key", "CENC content key 'KID:KEY' (hex; KID dashes optional) or bare 'KEY' (repeatable). Enables native in-process DRM decryption — no mp4decrypt needed")
 	flag.StringVar(&o.bbtsKey, "bbts-key", "", "16-byte AES key (32 hex) for BBTS-encrypted MPEG-TS segments; the per-segment IV is read from the stream's SDT")
@@ -238,9 +240,9 @@ func run() error {
 
 	outPath := outputPath(o.output, inputURL, live)
 	workDir := filepath.Dir(outPath)
-	ffmpeg, ffErr := mux.FindFFmpeg()
+	ffmpeg, ffErr := mux.FindFFmpeg(o.ffmpegPath)
 	if !o.noMux && ffErr != nil {
-		return fmt.Errorf("ffmpeg not found (needed for muxing; use -no-mux to skip): %w", ffErr)
+		return fmt.Errorf("ffmpeg not found (needed for muxing; pass -ffmpeg <path>, or -no-mux to skip): %w", ffErr)
 	}
 
 	sigCh := make(chan os.Signal, 2)

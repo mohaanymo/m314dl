@@ -19,8 +19,16 @@ type Input struct {
 	Default  bool
 }
 
-// FindFFmpeg looks next to our binary, then PATH.
-func FindFFmpeg() (string, error) {
+// FindFFmpeg resolves the ffmpeg binary. An explicit path (from -ffmpeg) wins —
+// it may be an absolute/relative path or a bare name found on PATH; otherwise it
+// looks next to our binary, then on PATH.
+func FindFFmpeg(explicit string) (string, error) {
+	if explicit != "" {
+		if p, err := exec.LookPath(explicit); err == nil {
+			return p, nil
+		}
+		return "", fmt.Errorf("ffmpeg not usable at %q", explicit)
+	}
 	if exe, err := os.Executable(); err == nil {
 		cand := filepath.Join(filepath.Dir(exe), "ffmpeg")
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {

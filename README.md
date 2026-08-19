@@ -105,7 +105,7 @@ only skipped with an explicit `-insecure`.
 go build -o m314dl .
 ```
 
-Requires `ffmpeg` on PATH (or next to the binary) for muxing.
+Requires `ffmpeg` on PATH (or next to the binary, or passed with `-ffmpeg <path>`) for muxing.
 
 ## Usage
 
