@@ -41,26 +41,27 @@ func (m *multiFlag) String() string     { return strings.Join(*m, ", ") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 type options struct {
-	output        string
-	threads       int
-	headers       multiFlag
-	cookies       string
-	proxy         string
-	insecure      bool
-	retries       int
-	listOnly      bool
-	sv, sa, ss    string
-	adKeywords    multiFlag
-	liveLimit     time.Duration
-	liveFromStart bool
-	noMux         bool
-	keepTemp      bool
-	subFormat     string
-	subExternal   bool
+	output           string
+	threads          int
+	headers          multiFlag
+	cookies          string
+	proxy            string
+	insecure         bool
+	retries          int
+	listOnly         bool
+	sv, sa, ss       string
+	adKeywords       multiFlag
+	liveLimit        time.Duration
+	liveFromStart    bool
+	noMux            bool
+	keepTemp         bool
+	subFormat        string
+	subExternal      bool
 	verbose          bool
 	timeout          time.Duration
 	progressInterval time.Duration
 	keys             multiFlag
+	bbtsKey          string
 }
 
 func main() {
@@ -89,6 +90,7 @@ func run() error {
 	flag.BoolVar(&o.noMux, "no-mux", false, "keep raw per-stream files, skip ffmpeg")
 	flag.BoolVar(&o.keepTemp, "keep", false, "keep temp stream files after mux")
 	flag.Var(&o.keys, "key", "CENC content key 'KID:KEY' (hex; KID dashes optional) or bare 'KEY' (repeatable). Enables native in-process DRM decryption — no mp4decrypt needed")
+	flag.StringVar(&o.bbtsKey, "bbts-key", "", "16-byte AES key (32 hex) for BBTS-encrypted MPEG-TS segments; the per-segment IV is read from the stream's SDT")
 	flag.StringVar(&o.subFormat, "sub-format", "srt", "subtitle output: srt or vtt")
 	flag.BoolVar(&o.subExternal, "sub-external", false, "write subtitles as sidecar files next to the output instead of muxing them in")
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
@@ -158,6 +160,14 @@ func run() error {
 	keys, err := parseKeys(o.keys)
 	if err != nil {
 		return err
+	}
+
+	var bbtsKey []byte
+	if o.bbtsKey != "" {
+		bbtsKey, err = hex.DecodeString(strings.TrimSpace(o.bbtsKey))
+		if err != nil || len(bbtsKey) != 16 {
+			return fmt.Errorf("bad -bbts-key: must be 32 hex chars (16 bytes)")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -261,7 +271,7 @@ func run() error {
 		threadCeiling = o.threads
 	}
 	cfg := engine.Config{
-		Client: client, Threads: threadCeiling, Keys: keys, AdFilters: adFilters,
+		Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey, AdFilters: adFilters,
 		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
 		FromStart: o.liveFromStart,
 	}
@@ -271,25 +281,47 @@ func run() error {
 		path string
 	}
 	var results []done
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(4) // concurrent streams; threads apply within each
 	for _, st := range selected {
 		results = append(results, done{st: st, path: engine.TempStreamPath(outPath, st, rawExt(st))})
 	}
+	// Stream scheduling. A stream's segments are latency-bound when small
+	// (subtitles: thousands of ~byte-sized segments) and bandwidth-bound when
+	// large (video). With only a few streams running at once, the many tiny
+	// subtitle streams serialize into batches and their round-trip latency piles
+	// up *after* the video finishes — a 5–6s tail on a 41-min asset. So run many
+	// streams concurrently, but cap each subtitle stream to a few workers: a
+	// handful hides its latency, and the cap keeps total in-flight requests
+	// bounded (streamPar × workers) even with 25 subtitle tracks and a big -t.
+	const subWorkerCap = 16
+	streamPar := len(results)
+	if streamPar < 4 {
+		streamPar = 4
+	} else if streamPar > 16 {
+		streamPar = 16
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(streamPar)
+	tDownload := time.Now()
 	for i := range results {
 		r := &results[i]
+		stCfg := cfg // per-stream copy (shares Client/Progress pointers)
+		if r.st.Type == manifest.Subtitles && (stCfg.Threads == 0 || stCfg.Threads > subWorkerCap) {
+			stCfg.Threads = subWorkerCap
+		}
 		g.Go(func() error {
 			refresh := refreshFunc(client, kind, r.st, logv)
 			if !r.st.Live {
 				refresh = nil
 			}
-			if err := engine.DownloadStream(gctx, cfg, r.st, r.path, refresh); err != nil {
+			if err := engine.DownloadStream(gctx, stCfg, r.st, r.path, refresh); err != nil {
 				return fmt.Errorf("stream %s: %w", r.st.ID, err)
 			}
 			return nil
 		})
 	}
 	err = g.Wait()
+	logv("phase download: %s (%d streams)", time.Since(tDownload).Round(time.Millisecond), len(results))
+	tFinalize := time.Now()
 	close(progStop)
 	time.Sleep(50 * time.Millisecond) // let renderer print the final line
 	if err != nil {
@@ -334,6 +366,7 @@ func run() error {
 			Name: r.st.Name, Default: r.st.Default,
 		})
 	}
+	logv("phase subtitle-convert: %s", time.Since(tFinalize).Round(time.Millisecond))
 
 	if o.noMux {
 		fmt.Fprintln(os.Stderr, "done (raw streams kept):")
@@ -358,10 +391,12 @@ func run() error {
 		return nil
 	}
 
+	tMux := time.Now()
 	if err := mux.Mux(ffmpeg, muxInputs, outPath); err != nil {
 		fmt.Fprintf(os.Stderr, "mux failed; raw stream files kept in %s\n", workDir)
 		return err
 	}
+	logv("phase mux: %s (%d inputs)", time.Since(tMux).Round(time.Millisecond), len(muxInputs))
 	if !o.keepTemp {
 		for _, in := range muxInputs {
 			os.Remove(in.Path)

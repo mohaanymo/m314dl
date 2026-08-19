@@ -99,6 +99,11 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 			if in.Name != "" {
 				args = append(args, fmt.Sprintf("-metadata:s:s:%d", si), "title="+in.Name)
 			}
+			// Flag the first subtitle as default so a player turns it on without
+			// the viewer having to pick a track.
+			if si == 0 {
+				args = append(args, fmt.Sprintf("-disposition:s:%d", si), "default")
+			}
 			si++
 		}
 	}

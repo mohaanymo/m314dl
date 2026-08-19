@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mohamed/m314dl/internal/bbts"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
 )
@@ -31,6 +32,7 @@ type Config struct {
 	Client    *httpx.Client
 	Threads   int                 // concurrency ceiling; 0 = auto (up to adaptiveMax)
 	Keys      map[[16]byte][]byte // CENC content keys by KID (zero KID = bare key)
+	BBTSKey   []byte              // 16-byte AES key; set → every .ts segment is BBTS-decrypted
 	AdFilters []*regexp.Regexp
 	LiveLimit time.Duration   // stop live recording after this long (0 = until end)
 	Stop      <-chan struct{} // graceful live stop: feeder exits, pipeline drains, mux proceeds
@@ -380,8 +382,8 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 }
 
 // decryptSegment applies the same in-place transforms the old inline path did,
-// in the same order: strip fake image header, then CENC, then AES-128.
-func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, it item, data []byte) ([]byte, error) {
+// in the same order: strip fake image header, then CENC, then AES-128, then BBTS.
+func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsKey []byte, it item, data []byte) ([]byte, error) {
 	data = stripFakeImageHeader(data)
 	if !it.isInit && dec != nil && it.key != nil && it.key.Method == manifest.EncCENC {
 		if err := dec.decrypt(data); err != nil {
@@ -402,6 +404,15 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, it it
 		if err != nil {
 			return nil, err
 		}
+	}
+	// BBTS: whole-segment iQiyi-style TS cipher. The key is supplied out of band;
+	// the IV rides in each segment's own SDT. Media segments only (no init).
+	if len(bbtsKey) > 0 && !it.isInit {
+		out, err := bbts.Decrypt(data, bbtsKey)
+		if err != nil {
+			return nil, fmt.Errorf("BBTS decrypt: %w", err)
+		}
+		data = out
 	}
 	return data, nil
 }
@@ -537,7 +548,7 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 		if err != nil {
 			return fmt.Errorf("read segment %d: %w", idx, err)
 		}
-		data, err = decryptSegment(ctx, kc, dec, p.it, data)
+		data, err = decryptSegment(ctx, kc, dec, cfg.BBTSKey, p.it, data)
 		if err != nil {
 			return err
 		}

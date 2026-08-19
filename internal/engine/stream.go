@@ -57,8 +57,20 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		rngHdr := resumeRange(it.rng != nil, segStart, segEnd, have)
-		resp, err := cfg.Client.RangeGet(ctx, it.url, rngHdr)
+		// Per-attempt idle watchdog: a throttling CDN (common when concurrency is
+		// pushed high) often holds the connection open and sends nothing rather
+		// than returning 429. Without this the read below blocks forever and the
+		// whole download stalls at 0 B/s. The watchdog cancels this attempt if no
+		// byte arrives for segIdleTimeout — headers or body — so the retry loop
+		// resumes from the bytes already on disk. ctx.Err() stays nil (only the
+		// child was cancelled), which is exactly why these paths must treat a
+		// cancelled attempt as retryable, not fatal.
+		reqCtx, cancel := context.WithCancel(ctx)
+		wd := time.AfterFunc(segIdleTimeout, cancel)
+		resp, err := cfg.Client.RangeGet(reqCtx, it.url, rngHdr)
 		if err != nil {
+			wd.Stop()
+			cancel()
 			if ctx.Err() != nil || attempt >= cfg.Client.Retries() {
 				return pressure, err
 			}
@@ -71,10 +83,14 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 		switch {
 		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 			resp.Body.Close()
+			wd.Stop()
+			cancel()
 			return pressure, nil // server says we already have it all
 		case resp.StatusCode == http.StatusOK && have > 0:
 			// server ignored Range: restart from the beginning
 			resp.Body.Close()
+			wd.Stop()
+			cancel()
 			if err := f.Truncate(0); err != nil {
 				return pressure, err
 			}
@@ -86,6 +102,8 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			ra := httpx.ParseRetryAfter(resp.Header.Get("Retry-After"))
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
+			wd.Stop()
+			cancel()
 			if httpx.Retriable(code) {
 				pressure++
 			}
@@ -98,22 +116,37 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			continue
 		}
 
-		// 2xx: stream the body to disk, counting bytes as they arrive
-		n, rerr := streamBody(resp.Body, f, cfg.Progress, ctl)
+		// 2xx: stream the body to disk, counting bytes as they arrive. Each byte
+		// received re-arms the watchdog, so a live-but-slow transfer is never cut.
+		n, rerr := streamBody(resp.Body, f, cfg.Progress, ctl, func() {
+			wd.Reset(segIdleTimeout)
+		})
 		resp.Body.Close()
+		wd.Stop()
+		cancel()
 		have += n
 		if rerr == nil {
 			return pressure, nil // complete
 		}
-		// mid-body failure: retry, resuming from the bytes we kept
+		// mid-body failure (including a watchdog cancel): retry, resuming from the
+		// bytes we kept. A watchdog stall counts as rate-limit pressure. Note the
+		// guard is on the PARENT ctx — a watchdog-cancelled attempt leaves it nil,
+		// so it retries; a user abort cancels the parent and stops.
 		if attempt >= cfg.Client.Retries() || ctx.Err() != nil {
 			return pressure, fmt.Errorf("read body: %w", rerr)
 		}
+		pressure++
 		if !retryWait(ctx, &backoff, 0) {
 			return pressure, ctx.Err()
 		}
 	}
 }
+
+// segIdleTimeout bounds how long a single segment fetch may receive no bytes
+// before it is abandoned and retried. Generous enough that a slow-but-alive
+// link is never cut, short enough that a silently-throttled connection self-heals
+// instead of stalling the whole download at 0 B/s.
+const segIdleTimeout = 30 * time.Second
 
 // resumeRange builds the Range header to fetch the not-yet-downloaded tail.
 func resumeRange(ranged bool, segStart, segEnd, have int64) string {
@@ -132,12 +165,15 @@ func resumeRange(ranged bool, segStart, segEnd, have int64) string {
 
 // streamBody copies body into f, reporting bytes to progress and the controller
 // as they arrive (smooth throughput, and a live counter during a huge segment).
-func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller) (int64, error) {
+func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller, keepalive func()) (int64, error) {
 	buf := make([]byte, 1<<20)
 	var total int64
 	for {
 		n, rerr := body.Read(buf)
 		if n > 0 {
+			if keepalive != nil {
+				keepalive() // bytes arrived — re-arm the idle watchdog
+			}
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return total, werr
 			}
