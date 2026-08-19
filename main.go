@@ -33,7 +33,7 @@ import (
 	"github.com/mohamed/m314dl/internal/subs"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type multiFlag []string
 

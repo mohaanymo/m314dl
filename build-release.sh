@@ -9,6 +9,16 @@ VER=${1:-$(grep -oP 'version = "\K[^"]+' main.go)}
 OUT=dist
 rm -rf "$OUT"; mkdir -p "$OUT"
 
+# makezip <out.zip> <dir> — run inside $OUT. Uses zip if present, else python3
+# (this box, and many minimal CI images, ship python but not zip).
+makezip() {
+  if command -v zip >/dev/null 2>&1; then
+    zip -qr "$1" "$2"
+  else
+    python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1][:-4],'zip','.',sys.argv[2])" "$1" "$2"
+  fi
+}
+
 # os/arch/goarm — the platforms competitors ship, plus arm.
 TARGETS=(
   "linux amd64 ."
@@ -31,7 +41,7 @@ for t in "${TARGETS[@]}"; do
   cp README.md "$stage/"
   base="m314dl_v${VER}_${GOOS}_${GOARCH}"
   if [ "$GOOS" = windows ]; then
-    (cd "$OUT" && zip -qr "${base}.zip" "$base") && rm -rf "$stage"
+    (cd "$OUT" && makezip "${base}.zip" "$base") && rm -rf "$stage"
     echo "  $base.zip"
   else
     tar -C "$OUT" -czf "$OUT/${base}.tar.gz" "$base" && rm -rf "$stage"
@@ -39,6 +49,6 @@ for t in "${TARGETS[@]}"; do
   fi
 done
 
-(cd "$OUT" && sha256sum m314dl_v${VER}_* > SHA256SUMS)
+(cd "$OUT" && sha256sum m314dl_v${VER}_*.tar.gz m314dl_v${VER}_*.zip > SHA256SUMS)
 echo "== done: $(ls "$OUT" | grep -c -E 'tar.gz|zip') archives in $OUT/ =="
 ls -lh "$OUT"
