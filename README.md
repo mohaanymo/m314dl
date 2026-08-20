@@ -180,10 +180,14 @@ m314dl -serve :8314 -key KID:KEY https://example.com/manifest.mpd
 # re-serve as one continuous MPEG-TS instead (VLC, set-top boxes)
 m314dl -serve :8314 -serve-format ts https://example.com/live.m3u8
 # → http://localhost:8314/live.ts
+
+# re-serve as live DASH (dash.js, Shaka, ExoPlayer)
+m314dl -serve :8314 -serve-format dash https://example.com/manifest.mpd
+# → http://localhost:8314/live.mpd
 ```
 
-Open `http://<host>:8314/live.m3u8` (HLS) or `http://<host>:8314/live.ts`
-(MPEG-TS) in VLC, mpv, hls.js, or any player.
+Open `http://<host>:8314/live.m3u8` (HLS), `/live.ts` (MPEG-TS), or `/live.mpd`
+(DASH) in VLC, mpv, hls.js, dash.js, or any player.
 
 What it serves:
 
@@ -205,6 +209,13 @@ falls a full buffer behind is dropped, and no other viewer ever waits on it
 (unlike a naive broadcaster that stalls everyone on the slowest client). Needs a
 muxed TS source; fMP4→TS remux and separate-audio muxing are later phases.
 
+DASH mode serves `GET /live.mpd` — a SegmentTemplate + SegmentTimeline manifest
+plus the same in-memory fMP4 segments (one AdaptationSet per media type, one
+Representation per track, each with its own timeline built from real segment
+durations). A live source produces a `dynamic` MPD with `minimumUpdatePeriod`; a
+finite one produces a `static` MPD with `mediaPresentationDuration`. Needs an
+fMP4 source (a TS source must be remuxed first — a later phase).
+
 How it's built — and why it's different from an FFmpeg restreamer:
 
 - **No FFmpeg on the copy path.** Segments arrive already decrypted and in
@@ -222,9 +233,9 @@ How it's built — and why it's different from an FFmpeg restreamer:
 - **Live and VOD.** A live source rolls a window; a finite source publishes the
   whole thing and caps it with `EXT-X-ENDLIST`, then keeps serving until Ctrl-C.
 
-Scope today: copy-only (same container family — TS→TS/HLS, fMP4→fMP4/CMAF-HLS),
-video and audio. Cross-container remux (fMP4↔TS), separate-audio muxing into TS,
-and live DASH output are planned; subtitle restreaming is not wired up yet.
+Scope today: copy-only (same container family — TS→TS/HLS, fMP4→fMP4/CMAF-HLS
+or DASH), video and audio. Cross-container remux (fMP4↔TS) and separate-audio
+muxing into TS are planned; subtitle restreaming is not wired up yet.
 
 ## Selector syntax
 

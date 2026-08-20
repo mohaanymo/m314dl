@@ -81,6 +81,19 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 		pres, handler, path = b, restream.NewTSServer(b), "/live.ts"
 		jobs = []job{{st: st, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(st))}}
 		fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", "ts", st)
+	case "dash", "mpd":
+		if err := requireFMP4(streams); err != nil {
+			return err
+		}
+		pub := restream.NewPublisher()
+		namer := newNamer()
+		for _, st := range streams {
+			id := namer(st)
+			sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
+			jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
+			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", id, st)
+		}
+		pres, handler, path = pub, restream.NewServer(pub).DASHHandler(), "/live.mpd"
 	case "", "hls":
 		pub := restream.NewPublisher()
 		namer := newNamer()
@@ -92,7 +105,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 		}
 		pres, handler, path = pub, restream.NewServer(pub).Handler(), "/live.m3u8"
 	default:
-		return fmt.Errorf("-serve-format %q: want hls or ts", o.serveFormat)
+		return fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.serveFormat)
 	}
 
 	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
@@ -208,6 +221,17 @@ func singleMuxedTS(streams []*manifest.Stream) (*manifest.Stream, error) {
 		fmt.Fprintln(os.Stderr, "restream: MPEG-TS output carries only the muxed video track; other selected tracks are ignored (separate-audio muxing is a later phase)")
 	}
 	return st, nil
+}
+
+// requireFMP4 rejects a DASH-output selection that contains a TS track: DASH
+// segments must be fMP4, and remuxing TS→fMP4 is a later phase.
+func requireFMP4(streams []*manifest.Stream) error {
+	for _, st := range streams {
+		if st.Init == nil && !segmentIsFMP4TS(st) {
+			return fmt.Errorf("restream -serve-format dash: track %s is MPEG-TS, not fMP4; DASH output needs an fMP4 source (TS→fMP4 remux is a later phase)", st.ID)
+		}
+	}
+	return nil
 }
 
 func segmentIsFMP4TS(st *manifest.Stream) bool {

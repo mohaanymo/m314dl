@@ -152,23 +152,25 @@ type Track struct {
 	live       bool   // live: roll a fixed window; VOD: keep every segment
 	segExt     string // "ts" | "m4s"
 
-	mu        sync.RWMutex
-	init      []byte
-	initAt    time.Time
-	segs      []*segment
-	targetDur float64
-	seq       int64 // output media sequence of the next segment (monotonic; never reset)
-	published int64 // total ever published (for stats)
-	ended     bool
+	mu          sync.RWMutex
+	init        []byte
+	initAt      time.Time
+	segs        []*segment
+	targetDur   float64
+	seq         int64 // output media sequence of the next segment (monotonic; never reset)
+	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
+	published   int64 // total ever published (for stats)
+	ended       bool
 }
 
 type segment struct {
-	name string
-	seq  int64
-	dur  float64
-	disc bool
-	data []byte
-	at   time.Time
+	name    string
+	seq     int64
+	dur     float64
+	startMS int64 // presentation start time in ms (DASH SegmentTimeline @t)
+	disc    bool
+	data    []byte
+	at      time.Time
 }
 
 // TrackFromStream builds a Track from a selected stream. id is a short,
@@ -230,11 +232,12 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	seq := t.seq
 	seg := &segment{
 		name: fmt.Sprintf("%06d.%s", seq, t.segExt),
-		seq:  seq, dur: dur, disc: info.Discontinuity,
+		seq:  seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity,
 		data: append([]byte(nil), data...), at: time.Now(),
 	}
 	t.segs = append(t.segs, seg)
 	t.seq++
+	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
 
 	// Live: trim beyond window+tail; the tail keeps just-evicted segments

@@ -105,7 +105,7 @@ func run() error {
 	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
 	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
-	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (multivariant + segments) or ts (one continuous MPEG-TS at /live.ts; needs a muxed TS source)")
+	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (one continuous MPEG-TS at /live.ts; needs a muxed TS source), or dash (/live.mpd; needs an fMP4 source)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)

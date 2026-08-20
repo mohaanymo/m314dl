@@ -31,7 +31,30 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-const mimeM3U8 = "application/vnd.apple.mpegurl"
+// DASHHandler serves the same in-memory window as a DASH presentation:
+//
+//	GET /live.mpd         → the manifest (SegmentTemplate + SegmentTimeline)
+//	GET /{track}/init.mp4 → init segment (shared with the HLS handler)
+//	GET /{track}/{seg}    → one media segment (shared with the HLS handler)
+func (s *Server) DASHHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /live.mpd", s.mpd)
+	mux.HandleFunc("GET /{track}/init.mp4", s.initSeg)
+	mux.HandleFunc("GET /{track}/{seg}", s.segment)
+	return mux
+}
+
+const (
+	mimeM3U8 = "application/vnd.apple.mpegurl"
+	mimeMPD  = "application/dash+xml"
+)
+
+func (s *Server) mpd(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	w.Header().Set("Content-Type", mimeMPD)
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Write(s.pub.DASHManifest())
+}
 
 func (s *Server) master(w http.ResponseWriter, r *http.Request) {
 	writePlaylist(w, s.pub.masterPlaylist())
