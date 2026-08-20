@@ -63,6 +63,8 @@ type options struct {
 	progressInterval time.Duration
 	keys             multiFlag
 	bbtsKey          string
+	rpc              string
+	rpcSecret        string
 }
 
 func main() {
@@ -98,6 +100,8 @@ func run() error {
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
 	flag.DurationVar(&o.timeout, "timeout", 0, "per-request timeout (default none; retries handle stalls)")
 	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
+	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
+	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
@@ -114,6 +118,12 @@ func run() error {
 	if *showVersion {
 		fmt.Println("m314dl", version)
 		return nil
+	}
+	if o.rpc != "" {
+		if flag.NArg() != 0 {
+			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
+		}
+		return serveRPC(o.rpc, o.rpcSecret)
 	}
 	// Adaptive concurrency unless the user pinned -t.
 	tPinned := false

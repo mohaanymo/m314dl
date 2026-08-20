@@ -134,6 +134,34 @@ m314dl -o video.mp4 https://example.com/watch/12345
 
 Run `m314dl -h` for all flags.
 
+## RPC server (remote downloads)
+
+Run m314dl on a server and submit jobs over HTTP/JSON. Each job is a child
+m314dl process, so every flag, resume, and graceful-stop behavior works
+exactly as it does locally.
+
+```bash
+# on the server (a secret is required on non-loopback binds)
+m314dl -rpc 0.0.0.0:8314 -rpc-secret mytoken
+
+# submit a job (args = normal CLI flags)
+curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/add \
+  -d '{"url":"https://example.com/master.m3u8","args":["-o","movie.mp4","-key","KID:KEY"]}'
+# → {"id":1}
+
+# watch: state, latest progress line, error if any
+curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs
+curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs/1   # + full log
+
+# stop gracefully (live: mux what's recorded; VOD: save resume state);
+# call twice to abort — same semantics as Ctrl-C
+curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/jobs/1/stop
+```
+
+Output files land in the server's working directory unless `-o` gives a path.
+An authenticated client has the full power of the CLI on the server — treat
+the secret like an SSH key.
+
 ## Selector syntax
 
 `-sv`, `-sa`, `-ss` accept:
@@ -202,3 +230,7 @@ The CENC test suite proves decryption two independent ways: **byte-exact
 parity** with `mp4decrypt` on real shaka-packaged fixtures (skips if the fixtures
 or `mp4decrypt` are absent), and **hermetic round-trips** that build fragments
 in-code and recover the plaintext with no external dependencies.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
