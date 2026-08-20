@@ -24,6 +24,7 @@ import (
 	"github.com/mohamed/m314dl/internal/engine"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mux"
 	"github.com/mohamed/m314dl/internal/restream"
 )
 
@@ -73,14 +74,34 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 
 	switch o.serveFormat {
 	case "ts", "mpegts":
-		st, err := singleMuxedTS(streams)
+		if pure := singleMuxedTS(streams); pure != nil && o.serveTranscode == "" {
+			// Source is already a muxed TS: copy segments straight out, no ffmpeg.
+			b := restream.NewTSBroadcaster()
+			pres, handler, path = b, restream.NewTSServer(b), "/live.ts"
+			jobs = []job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(pure))}}
+			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", "ts", pure)
+			break
+		}
+		// fMP4 source, separate audio, or a transcode was asked for: remux with
+		// one long-lived ffmpeg feeding the broadcaster.
+		ffmpeg, err := mux.FindFFmpeg(o.ffmpegPath)
+		if err != nil {
+			return fmt.Errorf("restream ts: source needs remuxing to MPEG-TS but ffmpeg not found (pass -ffmpeg <path>): %w", err)
+		}
+		var targs []string
+		if o.serveTranscode != "" {
+			targs = strings.Fields(o.serveTranscode)
+		}
+		b := restream.NewTSBroadcaster()
+		rem, err := restream.NewRemuxTS(ffmpeg, len(streams), targs, b, logv)
 		if err != nil {
 			return err
 		}
-		b := restream.NewTSBroadcaster()
-		pres, handler, path = b, restream.NewTSServer(b), "/live.ts"
-		jobs = []job{{st: st, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(st))}}
-		fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", "ts", st)
+		for i, st := range streams {
+			jobs = append(jobs, job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+rawExt(st))})
+			fmt.Fprintf(os.Stderr, "restream input %-8d %s\n", i, st)
+		}
+		pres, handler, path = rem, restream.NewTSServer(b), "/live.ts"
 	case "dash", "mpd":
 		if err := requireFMP4(streams); err != nil {
 			return err
@@ -141,6 +162,15 @@ func serve(ctx context.Context, o options, client *httpx.Client, kind string,
 	statusStop := make(chan struct{})
 	go statusLoop(pres, statusStop)
 
+	// On cancel, end the presentation immediately. For the ffmpeg remux path this
+	// closes the input pipes, so a download goroutine blocked writing to a stalled
+	// ffmpeg unblocks with EPIPE and g.Wait can return. End is idempotent, so the
+	// post-Wait End below is harmless.
+	go func() {
+		<-ctx.Done()
+		pres.End()
+	}()
+
 	g, gctx := errgroup.WithContext(ctx)
 	for _, j := range jobs {
 		j := j
@@ -200,27 +230,21 @@ func statusLoop(pres presentation, stop <-chan struct{}) {
 	}
 }
 
-// singleMuxedTS returns the one muxed TS track for continuous MPEG-TS output,
-// or an error explaining why the selection can't produce one. Muxing separate
-// elementary streams into TS, or remuxing fMP4 to TS, is a later phase.
-func singleMuxedTS(streams []*manifest.Stream) (*manifest.Stream, error) {
-	var video []*manifest.Stream
-	for _, st := range streams {
-		if st.Type == manifest.Video {
-			video = append(video, st)
-		}
+// singleMuxedTS returns the one muxed TS video track that the pure-Go path can
+// copy straight out, or nil when the selection needs FFmpeg remuxing (an fMP4
+// source, or a separate audio track to mux in).
+func singleMuxedTS(streams []*manifest.Stream) *manifest.Stream {
+	if len(streams) != 1 {
+		return nil // separate audio (or more) → must be muxed together → remux
 	}
-	if len(video) == 0 {
-		return nil, fmt.Errorf("restream -serve-format ts: no video track selected")
+	st := streams[0]
+	if st.Type != manifest.Video {
+		return nil
 	}
-	st := video[0]
 	if st.Init != nil || segmentIsFMP4TS(st) {
-		return nil, fmt.Errorf("restream -serve-format ts: source is fMP4, not MPEG-TS; use -serve-format hls (fMP4→TS remux is a later phase)")
+		return nil // fMP4 → remux to TS
 	}
-	if len(streams) > 1 {
-		fmt.Fprintln(os.Stderr, "restream: MPEG-TS output carries only the muxed video track; other selected tracks are ignored (separate-audio muxing is a later phase)")
-	}
-	return st, nil
+	return st
 }
 
 // requireFMP4 rejects a DASH-output selection that contains a TS track: DASH

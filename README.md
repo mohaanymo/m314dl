@@ -199,15 +199,24 @@ HLS mode serves:
 - `GET /{track}/000123.ts` — a media segment
 
 MPEG-TS mode serves `GET /live.ts` — one never-ending transport stream fanned
-out to every viewer. A TS-input stream's segments are already MPEG-TS, so they
-concatenate into a valid continuous stream with no re-mux; each viewer joins on
-a segment boundary (a clean, decodable PAT/PMT + keyframe start). Continuity
-counters are renumbered into one seamless per-PID sequence across segment
-boundaries — the one good idea from FFmpeg-based restreamers, done in-process
-with no reconnect seam to bridge. And the fan-out is non-blocking: a viewer that
-falls a full buffer behind is dropped, and no other viewer ever waits on it
-(unlike a naive broadcaster that stalls everyone on the slowest client). Needs a
-muxed TS source; fMP4→TS remux and separate-audio muxing are later phases.
+out to every viewer. The fan-out is non-blocking: a viewer that falls a full
+buffer behind is dropped, and no other viewer ever waits on it (unlike a naive
+broadcaster that stalls everyone on the slowest client).
+
+- **TS source → pure Go, no FFmpeg.** The segments are already MPEG-TS, so they
+  concatenate into a valid continuous stream with no re-mux; each viewer joins on
+  a segment boundary (a clean, decodable PAT/PMT + keyframe start). Continuity
+  counters are renumbered into one seamless per-PID sequence across boundaries —
+  the one good idea from FFmpeg restreamers, done in-process with no reconnect
+  seam to bridge.
+- **fMP4 source, or separate video+audio → one FFmpeg remux.** When the source
+  isn't already a muxed TS, m314dl runs a single long-lived FFmpeg that
+  copy-remuxes the decrypted tracks into TS (separate audio is muxed in). One
+  process for the whole stream — not one per segment — and no `-re` pacing
+  (segment arrival paces it). Because m314dl decrypts upstream, FFmpeg only sees
+  a clear copy, so the DRM-demuxer memory leak that plagues FFmpeg restreamers
+  never applies. Pass `-serve-transcode '<ffmpeg args>'` to re-encode instead of
+  copy (e.g. `-c:v libx264 -preset veryfast -c:a aac`).
 
 DASH mode serves `GET /live.mpd` — a SegmentTemplate + SegmentTimeline manifest
 plus the same in-memory fMP4 segments (one AdaptationSet per media type, one
@@ -233,9 +242,10 @@ How it's built — and why it's different from an FFmpeg restreamer:
 - **Live and VOD.** A live source rolls a window; a finite source publishes the
   whole thing and caps it with `EXT-X-ENDLIST`, then keeps serving until Ctrl-C.
 
-Scope today: copy-only (same container family — TS→TS/HLS, fMP4→fMP4/CMAF-HLS
-or DASH), video and audio. Cross-container remux (fMP4↔TS) and separate-audio
-muxing into TS are planned; subtitle restreaming is not wired up yet.
+Scope today: HLS and DASH output are copy-only (same container family, no
+FFmpeg); MPEG-TS output copies a TS source in pure Go and remuxes an fMP4 or
+separate-audio source through one FFmpeg (with optional transcode). TS→fMP4 for
+DASH/HLS-fMP4 output, and subtitle restreaming, are not wired up yet.
 
 ## Selector syntax
 
