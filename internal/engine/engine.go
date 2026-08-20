@@ -39,6 +39,33 @@ type Config struct {
 	FromStart bool            // live: download the whole DVR window instead of starting at the edge
 	Progress  *Progress       // shared across streams; may be nil
 	Verbose   func(format string, args ...any)
+	// Sink, when non-nil, receives ordered decrypted segments instead of a file
+	// (live restreaming). The download pipeline is otherwise identical — same
+	// feeder, workers, decryption, and strict in-order commit — so restreaming
+	// inherits every property the file path has (adaptive concurrency, CENC/
+	// AES-128/BBTS decrypt, live refresh, hole tolerance).
+	Sink Sink
+}
+
+// Sink is the destination for one stream's ordered, decrypted segments. It is
+// the branch point between file output (default) and live restreaming; the
+// packager on the other side turns these calls into a live HLS/DASH/TS output.
+type Sink interface {
+	// Init hands over the fMP4 initialization segment (the HLS EXT-X-MAP / DASH
+	// init payload). Called at most once per init change, before the segments
+	// that reference it. TS streams have no init and never call this.
+	Init(data []byte) error
+	// Segment hands over one decrypted media segment, in strict playback order.
+	Segment(info SegmentInfo, data []byte) error
+}
+
+// SegmentInfo is the per-segment metadata a packager needs. Seq is the source
+// media sequence (for diagnostics; the packager assigns its own monotonic
+// output sequence, so a source that rewinds its numbering can't wedge output).
+type SegmentInfo struct {
+	Seq           int64
+	Duration      float64 // seconds; 0 = unknown
+	Discontinuity bool    // source signaled a discontinuity before this segment
 }
 
 // RefreshFunc re-fetches the playlist and returns the fresh stream state.
@@ -81,22 +108,33 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		dec = d
 	}
 
-	// single-segment stream (SegmentBase / plain file): direct streaming path
-	if !st.Live && len(st.Segments) == 1 && st.Segments[0].Key == nil && st.Segments[0].Range == nil {
+	// single-segment stream (SegmentBase / plain file): direct streaming path.
+	// Not taken when restreaming — a sink needs segment boundaries, not one blob.
+	if cfg.Sink == nil && !st.Live && len(st.Segments) == 1 && st.Segments[0].Key == nil && st.Segments[0].Range == nil {
 		return downloadSingleFile(ctx, cfg, st, outPath)
 	}
 
-	state, out, err := openOutput(outPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	// Resuming: segments already written count as done, so progress and ETA
-	// reflect real remaining work instead of restarting from 0/N.
-	if cfg.Progress != nil {
-		if n := state.NextIdx.Load(); n > 0 {
-			cfg.Progress.AddDone(n)
+	// File output opens the target and loads any resume checkpoint. Restreaming
+	// has neither: segments are ephemeral and live starts at the edge, so state
+	// stays zero and the feeder behaves exactly as a fresh live run.
+	var state *resumeState
+	var out *os.File
+	if cfg.Sink == nil {
+		s, f, err := openOutput(outPath)
+		if err != nil {
+			return err
 		}
+		state, out = s, f
+		defer out.Close()
+		// Resuming: segments already written count as done, so progress and ETA
+		// reflect real remaining work instead of restarting from 0/N.
+		if cfg.Progress != nil {
+			if n := state.NextIdx.Load(); n > 0 {
+				cfg.Progress.AddDone(n)
+			}
+		}
+	} else {
+		state = &resumeState{}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -132,7 +170,11 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	}
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, results)
+		if cfg.Sink != nil {
+			writerDone <- sinkWriter(ctx, cfg, st.Live, outPath, state, kc, dec, results)
+		} else {
+			writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, results)
+		}
 	}()
 
 	feedErr := feed(ctx, cfg, st, refresh, state, items)
@@ -530,36 +572,16 @@ type pend struct {
 	hole bool
 }
 
-func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+// commitInOrder drains results and commits segments in strict index order. It
+// is the single implementation of ordering and live-hole tolerance shared by
+// the file writer and the restream sink writer; only `commit` (what to do with
+// a ready segment) and `afterCommit` (per-segment bookkeeping, may be nil)
+// differ between them. Returns the first fatal error, or a missing-segments
+// error if the stream ended with gaps a non-live run can't tolerate.
+func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan result,
+	commit func(idx int64, p pend) error, afterCommit func(next int64)) error {
 	pending := map[int64]pend{}
 	var failed error
-
-	// commit decrypts one segment's part file and appends it to the output.
-	// ponytail: reads the whole part file into memory to decrypt (CENC/AES need
-	// the full segment); peak memory is one segment, not one per worker. A
-	// stream-copy fast path for clear segments could drop that to O(buffer) if a
-	// pathological huge-clear-segment case ever shows up.
-	commit := func(idx int64, p pend) error {
-		if p.hole {
-			return nil
-		}
-		part := partPath(outPath, idx)
-		data, err := os.ReadFile(part)
-		if err != nil {
-			return fmt.Errorf("read segment %d: %w", idx, err)
-		}
-		data, err = decryptSegment(ctx, kc, dec, cfg.BBTSKey, p.it, data)
-		if err != nil {
-			return err
-		}
-		if _, err := out.Write(data); err != nil {
-			return err
-		}
-		state.Offset += int64(len(data))
-		os.Remove(part)
-		return nil
-	}
-
 	for r := range results {
 		if r.err != nil {
 			if failed == nil {
@@ -567,7 +589,7 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 			}
 			cfg.Verbose("segment failed: %s: %v", r.it.url, r.err)
 			if live {
-				// live: the segment is gone; hole keeps the recording moving
+				// live: the segment is gone; a hole keeps the stream moving
 				pending[r.it.idx] = pend{hole: true}
 			}
 			// VOD: no hole — the resume index must not advance past a failed
@@ -589,26 +611,96 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 			if cfg.Progress != nil {
 				cfg.Progress.AddDone(1)
 			}
-			// Checkpoint on every commit. This process may be killed without
-			// warning (a raw-mode TUI turns Ctrl-C into a keypress, not a signal),
-			// so the state must match what's on disk *before* the kill: a stale
-			// offset would make openOutput truncate committed data and re-download
-			// it. The uncommitted tail still resumes from its part files, so a kill
-			// costs at most the one segment being written. The write is atomic and
-			// tiny; fsync stays periodic (power-loss hardening).
-			state.save(outPath)
-			if next%20 == 0 {
-				out.Sync()
+			if afterCommit != nil {
+				afterCommit(next)
 			}
 		}
 	}
-	out.Sync()
-	state.save(outPath)
 	// missing index means the segment failed to download
 	if len(pending) > 0 && failed == nil {
 		failed = fmt.Errorf("%d segments missing at end of stream", len(pending))
 	}
 	return failed
+}
+
+// writer commits segments to a single output file with resume checkpointing.
+func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+	// commit decrypts one segment's part file and appends it to the output.
+	// ponytail: reads the whole part file into memory to decrypt (CENC/AES need
+	// the full segment); peak memory is one segment, not one per worker. A
+	// stream-copy fast path for clear segments could drop that to O(buffer) if a
+	// pathological huge-clear-segment case ever shows up.
+	commit := func(idx int64, p pend) error {
+		if p.hole {
+			return nil
+		}
+		data, err := readDecrypt(ctx, cfg, kc, dec, outPath, idx, p.it)
+		if err != nil {
+			return err
+		}
+		if _, err := out.Write(data); err != nil {
+			return err
+		}
+		state.Offset += int64(len(data))
+		return nil
+	}
+	// Checkpoint on every commit. This process may be killed without warning (a
+	// raw-mode TUI turns Ctrl-C into a keypress, not a signal), so the state must
+	// match what's on disk *before* the kill: a stale offset would make
+	// openOutput truncate committed data and re-download it. The uncommitted tail
+	// still resumes from its part files, so a kill costs at most the one segment
+	// being written. The write is atomic and tiny; fsync stays periodic
+	// (power-loss hardening).
+	afterCommit := func(next int64) {
+		state.save(outPath)
+		if next%20 == 0 {
+			out.Sync()
+		}
+	}
+	err := commitInOrder(cfg, live, state, results, commit, afterCommit)
+	out.Sync()
+	state.save(outPath)
+	return err
+}
+
+// sinkWriter commits segments to a Sink (live restreaming) instead of a file:
+// same ordering and hole tolerance, no output file, no resume checkpoint.
+func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+	commit := func(idx int64, p pend) error {
+		if p.hole {
+			return nil
+		}
+		data, err := readDecrypt(ctx, cfg, kc, dec, outPath, idx, p.it)
+		if err != nil {
+			return err
+		}
+		if p.it.isInit {
+			return cfg.Sink.Init(data)
+		}
+		info := SegmentInfo{Seq: p.it.seq}
+		if p.it.seg != nil {
+			info.Duration = p.it.seg.Duration
+			info.Discontinuity = p.it.seg.Discontinuity
+		}
+		return cfg.Sink.Segment(info, data)
+	}
+	return commitInOrder(cfg, live, state, results, commit, nil)
+}
+
+// readDecrypt reads a committed segment's part file, decrypts it in place, and
+// deletes the part file. Shared by both writers.
+func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, outPath string, idx int64, it item) ([]byte, error) {
+	part := partPath(outPath, idx)
+	data, err := os.ReadFile(part)
+	if err != nil {
+		return nil, fmt.Errorf("read segment %d: %w", idx, err)
+	}
+	data, err = decryptSegment(ctx, kc, dec, cfg.BBTSKey, it, data)
+	if err != nil {
+		return nil, err
+	}
+	os.Remove(part)
+	return data, nil
 }
 
 // ---- single big file ----
