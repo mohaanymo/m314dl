@@ -176,16 +176,34 @@ m314dl -serve :8314 https://example.com/master.m3u8
 
 # decrypt a DRM DASH source and restream it in the clear
 m314dl -serve :8314 -key KID:KEY https://example.com/manifest.mpd
+
+# re-serve as one continuous MPEG-TS instead (VLC, set-top boxes)
+m314dl -serve :8314 -serve-format ts https://example.com/live.m3u8
+# → http://localhost:8314/live.ts
 ```
 
-Open `http://<host>:8314/live.m3u8` in VLC, mpv, hls.js, or any HLS player.
+Open `http://<host>:8314/live.m3u8` (HLS) or `http://<host>:8314/live.ts`
+(MPEG-TS) in VLC, mpv, hls.js, or any player.
 
 What it serves:
+
+HLS mode serves:
 
 - `GET /live.m3u8` — multivariant (master) playlist
 - `GET /{track}/index.m3u8` — a track's media playlist (`video`, `audio-en`, …)
 - `GET /{track}/init.mp4` — fMP4 init segment (EXT-X-MAP target)
 - `GET /{track}/000123.ts` — a media segment
+
+MPEG-TS mode serves `GET /live.ts` — one never-ending transport stream fanned
+out to every viewer. A TS-input stream's segments are already MPEG-TS, so they
+concatenate into a valid continuous stream with no re-mux; each viewer joins on
+a segment boundary (a clean, decodable PAT/PMT + keyframe start). Continuity
+counters are renumbered into one seamless per-PID sequence across segment
+boundaries — the one good idea from FFmpeg-based restreamers, done in-process
+with no reconnect seam to bridge. And the fan-out is non-blocking: a viewer that
+falls a full buffer behind is dropped, and no other viewer ever waits on it
+(unlike a naive broadcaster that stalls everyone on the slowest client). Needs a
+muxed TS source; fMP4→TS remux and separate-audio muxing are later phases.
 
 How it's built — and why it's different from an FFmpeg restreamer:
 
@@ -204,9 +222,9 @@ How it's built — and why it's different from an FFmpeg restreamer:
 - **Live and VOD.** A live source rolls a window; a finite source publishes the
   whole thing and caps it with `EXT-X-ENDLIST`, then keeps serving until Ctrl-C.
 
-Scope today: copy-only (same container family — TS→TS, fMP4→fMP4/CMAF), video
-and audio. Cross-container remux, continuous MPEG-TS output, and DASH output are
-planned; subtitle restreaming is not wired up yet.
+Scope today: copy-only (same container family — TS→TS/HLS, fMP4→fMP4/CMAF-HLS),
+video and audio. Cross-container remux (fMP4↔TS), separate-audio muxing into TS,
+and live DASH output are planned; subtitle restreaming is not wired up yet.
 
 ## Selector syntax
 

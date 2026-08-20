@@ -66,6 +66,7 @@ type options struct {
 	rpc              string
 	rpcSecret        string
 	serve            string
+	serveFormat      string
 }
 
 func main() {
@@ -103,7 +104,8 @@ func run() error {
 	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
 	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
 	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
-	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams as live HLS on this address (e.g. :8314) instead of downloading to a file; serve http://<addr>/live.m3u8")
+	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
+	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (multivariant + segments) or ts (one continuous MPEG-TS at /live.ts; needs a muxed TS source)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)

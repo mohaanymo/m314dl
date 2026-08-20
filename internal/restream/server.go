@@ -89,6 +89,41 @@ func writePlaylist(w http.ResponseWriter, body []byte) {
 	w.Write(body)
 }
 
+// NewTSServer serves a continuous MPEG-TS broadcast:
+//
+//	GET /live.ts → one never-ending transport stream, fanned out from the
+//	              shared broadcaster; each viewer joins on a segment boundary.
+func NewTSServer(b *TSBroadcaster) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /live.ts", func(w http.ResponseWriter, r *http.Request) {
+		cors(w)
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		flusher, _ := w.(http.Flusher)
+
+		sub := b.Subscribe()
+		defer b.Unsubscribe(sub)
+		for {
+			select {
+			case seg := <-sub.data:
+				if _, err := w.Write(seg); err != nil {
+					return // client went away
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			case <-sub.kicked:
+				return // fell too far behind
+			case <-b.done:
+				return // stream ended
+			case <-r.Context().Done():
+				return // client disconnected
+			}
+		}
+	})
+	return mux
+}
+
 func segmentMIME(name string) string {
 	if strings.HasSuffix(name, ".ts") {
 		return "video/mp2t"

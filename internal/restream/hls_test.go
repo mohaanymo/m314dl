@@ -25,7 +25,7 @@ func TestMediaPlaylistFMP4(t *testing.T) {
 
 	pl := string(pub.tracks[0].mediaPlaylist())
 	for _, want := range []string{
-		"#EXT-X-VERSION:6",       // fMP4 requires v6 (worker shipped v3 here — bug)
+		"#EXT-X-VERSION:6", // fMP4 requires v6 (worker shipped v3 here — bug)
 		"#EXT-X-TARGETDURATION:6",
 		"#EXT-X-MEDIA-SEQUENCE:0",
 		"#EXT-X-MAP:URI=\"init.mp4\"",

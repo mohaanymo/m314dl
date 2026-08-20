@@ -1,7 +1,10 @@
-// Restream mode (-serve): download the selected streams and republish them as
-// a live HLS presentation over HTTP, instead of writing a file. Video and audio
-// tracks each feed one restream.Track through the normal engine pipeline; the
-// packager renders the playlists and an HTTP server serves them.
+// Restream mode (-serve): download the selected streams and republish them live
+// over HTTP instead of writing a file. Two output shapes share one run loop:
+//
+//   - HLS (-serve-format hls, default): a multivariant playlist plus a rolling
+//     window of segments, one media playlist per track.
+//   - MPEG-TS (-serve-format ts): a single continuous transport stream fanned
+//     out to every viewer. Requires one muxed TS source track.
 package main
 
 import (
@@ -24,14 +27,27 @@ import (
 	"github.com/mohamed/m314dl/internal/restream"
 )
 
-// runRestream serves the selected streams as live HLS on o.serve until the
-// source ends or the operator interrupts.
+// presentation is the output-format-agnostic surface the run loop needs: how to
+// finish the stream and how to describe its liveness.
+type presentation interface {
+	End()
+	StatusLine() string
+}
+
+// job is one source stream wired to the sink that publishes it.
+type job struct {
+	st   *manifest.Stream
+	sink engine.Sink
+	tmp  string
+}
+
+// runRestream selects the output format and hands off to the shared run loop.
 func runRestream(ctx context.Context, o options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
 	// Video and audio restream cleanly by copy; subtitles need live WebVTT
-	// segmentation that Phase 1 doesn't do, so skip them with a clear notice.
+	// segmentation that isn't wired up yet, so skip them with a clear notice.
 	var streams []*manifest.Stream
 	for _, st := range selected {
 		if st.Type == manifest.Subtitles {
@@ -44,37 +60,57 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 		return fmt.Errorf("restream: no video/audio streams selected")
 	}
 
-	// Part files are scratch: downloaded, decrypted, handed to the packager,
-	// deleted. A private temp dir keeps them out of the working directory.
 	tmpDir, err := os.MkdirTemp("", "m314dl-serve-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	pub := restream.NewPublisher()
-	namer := newNamer()
-	type job struct {
-		st   *manifest.Stream
-		sink engine.Sink
-		tmp  string
-	}
+	var pres presentation
 	var jobs []job
-	for _, st := range streams {
-		id := namer(st)
-		tr := restream.TrackFromStream(id, st, st.Live)
-		sink := pub.AddTrack(tr)
-		jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
-		fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", id, st)
+	var handler http.Handler
+	var path string
+
+	switch o.serveFormat {
+	case "ts", "mpegts":
+		st, err := singleMuxedTS(streams)
+		if err != nil {
+			return err
+		}
+		b := restream.NewTSBroadcaster()
+		pres, handler, path = b, restream.NewTSServer(b), "/live.ts"
+		jobs = []job{{st: st, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(st))}}
+		fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", "ts", st)
+	case "", "hls":
+		pub := restream.NewPublisher()
+		namer := newNamer()
+		for _, st := range streams {
+			id := namer(st)
+			sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
+			jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
+			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", id, st)
+		}
+		pres, handler, path = pub, restream.NewServer(pub).Handler(), "/live.m3u8"
+	default:
+		return fmt.Errorf("-serve-format %q: want hls or ts", o.serveFormat)
 	}
 
-	srv := &http.Server{Addr: o.serve, Handler: restream.NewServer(pub).Handler()}
+	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
+}
+
+// serve runs the download jobs into their sinks while an HTTP server publishes
+// the result, until the source ends or the operator interrupts.
+func serve(ctx context.Context, o options, client *httpx.Client, kind string,
+	jobs []job, pres presentation, handler http.Handler, path string,
+	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+
 	ln, err := net.Listen("tcp", o.serve)
 	if err != nil {
 		return fmt.Errorf("restream: listen on %s: %w", o.serve, err)
 	}
+	srv := &http.Server{Handler: handler}
 	go srv.Serve(ln)
-	fmt.Fprintf(os.Stderr, "\nrestreaming live HLS at http://%s/live.m3u8\n\n", displayAddr(ln.Addr()))
+	fmt.Fprintf(os.Stderr, "\nrestreaming live at http://%s%s\n\n", displayAddr(ln.Addr()), path)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -90,7 +126,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 	}()
 
 	statusStop := make(chan struct{})
-	go restreamStatus(pub, statusStop)
+	go statusLoop(pres, statusStop)
 
 	g, gctx := errgroup.WithContext(ctx)
 	for _, j := range jobs {
@@ -102,7 +138,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 			}
 			refresh := refreshFunc(client, kind, j.st, logv)
 			if !j.st.Live {
-				refresh = nil // finite source: publish it once, then ENDLIST
+				refresh = nil // finite source: publish it once, then finish
 			}
 			if err := engine.DownloadStream(gctx, cfg, j.st, j.tmp, refresh); err != nil {
 				return fmt.Errorf("track %s: %w", j.st.ID, err)
@@ -112,7 +148,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 	}
 	err = g.Wait()
 	close(statusStop)
-	pub.End()
+	pres.End()
 
 	shutdown := func() {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -126,9 +162,9 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 		return err
 	}
 	// A finite source finished publishing on its own: keep serving the completed
-	// VOD (playlists now carry EXT-X-ENDLIST) until the operator interrupts.
+	// stream (HLS now carries EXT-X-ENDLIST) until the operator interrupts.
 	if ctx.Err() == nil {
-		fmt.Fprintln(os.Stderr, "source complete — serving VOD until Ctrl-C")
+		fmt.Fprintln(os.Stderr, "source complete — serving until Ctrl-C")
 		<-ctx.Done()
 	}
 	shutdown()
@@ -136,9 +172,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 	return nil
 }
 
-// restreamStatus prints a periodic liveness line so the operator can see it is
-// working without opening a player.
-func restreamStatus(pub *restream.Publisher, stop <-chan struct{}) {
+func statusLoop(pres presentation, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
@@ -146,22 +180,42 @@ func restreamStatus(pub *restream.Publisher, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-tick.C:
-			var parts []string
-			for _, s := range pub.Stats() {
-				parts = append(parts, fmt.Sprintf("%s %d segs %s", s.ID, s.Published, fmtBitrate(s.Bitrate)))
-			}
-			if len(parts) > 0 {
-				fmt.Fprintf(os.Stderr, "live: %s\n", strings.Join(parts, " | "))
+			if line := pres.StatusLine(); line != "" {
+				fmt.Fprintf(os.Stderr, "live: %s\n", line)
 			}
 		}
 	}
 }
 
-func fmtBitrate(bps int64) string {
-	if bps <= 0 {
-		return "?"
+// singleMuxedTS returns the one muxed TS track for continuous MPEG-TS output,
+// or an error explaining why the selection can't produce one. Muxing separate
+// elementary streams into TS, or remuxing fMP4 to TS, is a later phase.
+func singleMuxedTS(streams []*manifest.Stream) (*manifest.Stream, error) {
+	var video []*manifest.Stream
+	for _, st := range streams {
+		if st.Type == manifest.Video {
+			video = append(video, st)
+		}
 	}
-	return fmt.Sprintf("%.1fMbps", float64(bps)/1e6)
+	if len(video) == 0 {
+		return nil, fmt.Errorf("restream -serve-format ts: no video track selected")
+	}
+	st := video[0]
+	if st.Init != nil || segmentIsFMP4TS(st) {
+		return nil, fmt.Errorf("restream -serve-format ts: source is fMP4, not MPEG-TS; use -serve-format hls (fMP4→TS remux is a later phase)")
+	}
+	if len(streams) > 1 {
+		fmt.Fprintln(os.Stderr, "restream: MPEG-TS output carries only the muxed video track; other selected tracks are ignored (separate-audio muxing is a later phase)")
+	}
+	return st, nil
+}
+
+func segmentIsFMP4TS(st *manifest.Stream) bool {
+	if len(st.Segments) == 0 {
+		return false
+	}
+	u := st.Segments[0].URL
+	return strings.Contains(u, ".m4s") || strings.Contains(u, ".cmf")
 }
 
 // newNamer assigns short, URL-safe, unique track ids: "video", "video2",

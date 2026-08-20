@@ -99,6 +99,20 @@ type Stats struct {
 	Bitrate   int64 // bits/sec (declared or measured)
 }
 
+// StatusLine implements the presentation status contract: one line summarizing
+// every track's liveness.
+func (p *Publisher) StatusLine() string {
+	var parts []string
+	for _, s := range p.Stats() {
+		br := "?"
+		if s.Bitrate > 0 {
+			br = fmt.Sprintf("%.1fMbps", float64(s.Bitrate)/1e6)
+		}
+		parts = append(parts, fmt.Sprintf("%s %d segs %s", s.ID, s.Published, br))
+	}
+	return strings.Join(parts, " | ")
+}
+
 func (p *Publisher) Stats() []Stats {
 	out := make([]Stats, 0, len(p.tracks))
 	for _, t := range p.tracks {
