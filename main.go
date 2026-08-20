@@ -65,6 +65,8 @@ type options struct {
 	bbtsKey          string
 	rpc              string
 	rpcSecret        string
+	rpcMaxJobs       int
+	rpcRetain        time.Duration
 	serve            string
 	serveFormat      string
 	serveTranscode   string
@@ -105,6 +107,8 @@ func run() error {
 	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
 	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
 	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
+	flag.IntVar(&o.rpcMaxJobs, "rpc-max-jobs", 64, "-rpc: max concurrent jobs; further /add requests get 503 until a slot frees (0 = unlimited)")
+	flag.DurationVar(&o.rpcRetain, "rpc-retain", time.Hour, "-rpc: keep finished jobs queryable at least this long before reaping (bounds memory)")
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
 	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source)")
 	flag.StringVar(&o.serveTranscode, "serve-transcode", "", "restream ts remux: ffmpeg output codec args to transcode instead of copy, e.g. '-c:v libx264 -preset veryfast -c:a aac' (implies the ffmpeg remux path)")
@@ -129,7 +133,7 @@ func run() error {
 		if flag.NArg() != 0 {
 			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
 		}
-		return serveRPC(o.rpc, o.rpcSecret)
+		return serveRPC(o.rpc, o.rpcSecret, o.rpcMaxJobs, o.rpcRetain)
 	}
 	// Adaptive concurrency unless the user pinned -t.
 	tPinned := false

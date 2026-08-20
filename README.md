@@ -142,16 +142,17 @@ exactly as it does locally.
 
 ```bash
 # on the server (a secret is required on non-loopback binds)
-m314dl -rpc 0.0.0.0:8314 -rpc-secret mytoken
+m314dl -rpc 0.0.0.0:8314 -rpc-secret mytoken -rpc-max-jobs 64
 
 # submit a job (args = normal CLI flags)
 curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/add \
   -d '{"url":"https://example.com/master.m3u8","args":["-o","movie.mp4","-key","KID:KEY"]}'
-# → {"id":1}
+# → {"id":1}   (or HTTP 503 if -rpc-max-jobs are already running)
 
 # watch: state, latest progress line, error if any
 curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs
 curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs/1   # + full log
+curl -H 'Authorization: Bearer mytoken' http://server:8314/health   # {"running":3,"total":57,"max":64}
 
 # stop gracefully (live: mux what's recorded; VOD: save resume state);
 # call twice to abort — same semantics as Ctrl-C
@@ -161,6 +162,23 @@ curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/jobs/1/stop
 Output files land in the server's working directory unless `-o` gives a path.
 An authenticated client has the full power of the CLI on the server — treat
 the secret like an SSH key.
+
+Built to run unattended in production:
+
+- **Bounded memory** — finished jobs are reaped after `-rpc-retain` (default 1h,
+  with a hard ceiling), and each job's captured log is capped. A server left up
+  for weeks doesn't grow without limit.
+- **Admission cap** — `-rpc-max-jobs` (default 64) bounds concurrent jobs; past
+  it, `/add` returns `503` instead of fork-bombing the host. `0` = unlimited.
+- **No lock contention** — each job's output is buffered under its own lock,
+  never a shared one, so hundreds of chatty jobs don't serialize on the server.
+- **Monotonic job ids** — a reaped id is never reused, so a stale client can't
+  address a recycled job.
+- **Graceful shutdown** — SIGINT/SIGTERM stops accepting, signals every running
+  job to finish, then exits. On Linux, jobs also die with the server even on a
+  hard crash (`Pdeathsig`), so a crash never leaves orphaned downloads.
+- **Hardened endpoints** — bounded request bodies, a read-header timeout, and
+  constant-time secret comparison.
 
 ## Restream: live HLS out (`-serve`)
 
