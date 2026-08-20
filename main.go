@@ -70,6 +70,9 @@ type options struct {
 	serve            string
 	serveFormat      string
 	serveTranscode   string
+	worker           string
+	workerSecret     string
+	workerMaxChan    int
 }
 
 func main() {
@@ -112,6 +115,9 @@ func run() error {
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
 	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source)")
 	flag.StringVar(&o.serveTranscode, "serve-transcode", "", "restream ts remux: ffmpeg output codec args to transcode instead of copy, e.g. '-c:v libx264 -preset veryfast -c:a aac' (implies the ffmpeg remux path)")
+	flag.StringVar(&o.worker, "worker", "", "run as a multi-channel restream worker on this address (e.g. :7001); drive it via POST /api/channels, serve /{id}/live.m3u8. See worker.go")
+	flag.StringVar(&o.workerSecret, "worker-secret", "", "bearer token for -worker control API (required when binding a non-loopback address)")
+	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
@@ -134,6 +140,17 @@ func run() error {
 			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
 		}
 		return serveRPC(o.rpc, o.rpcSecret, o.rpcMaxJobs, o.rpcRetain)
+	}
+	if o.worker != "" {
+		if flag.NArg() != 0 {
+			return fmt.Errorf("-worker takes no URL; start channels via POST /api/channels")
+		}
+		logv := func(format string, args ...any) {
+			if o.verbose {
+				fmt.Fprintf(os.Stderr, "[v] "+format+"\n", args...)
+			}
+		}
+		return serveWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, logv)
 	}
 	// Adaptive concurrency unless the user pinned -t.
 	tPinned := false

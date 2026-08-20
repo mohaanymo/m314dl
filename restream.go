@@ -42,24 +42,11 @@ type job struct {
 	tmp  string
 }
 
-// runRestream selects the output format and hands off to the shared run loop.
+// runRestream builds the output for the selected streams and hands off to the
+// blocking run loop (the one-shot `-serve` mode).
 func runRestream(ctx context.Context, o options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
-
-	// Video and audio restream cleanly by copy; subtitles need live WebVTT
-	// segmentation that isn't wired up yet, so skip them with a clear notice.
-	var streams []*manifest.Stream
-	for _, st := range selected {
-		if st.Type == manifest.Subtitles {
-			fmt.Fprintf(os.Stderr, "restream: skipping subtitle track %s (not supported by -serve yet)\n", st.ID)
-			continue
-		}
-		streams = append(streams, st)
-	}
-	if len(streams) == 0 {
-		return fmt.Errorf("restream: no video/audio streams selected")
-	}
 
 	tmpDir, err := os.MkdirTemp("", "m314dl-serve-*")
 	if err != nil {
@@ -67,26 +54,48 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 	}
 	defer os.RemoveAll(tmpDir)
 
-	var pres presentation
-	var jobs []job
-	var handler http.Handler
-	var path string
+	pres, handler, path, jobs, err := buildOutputs(o, selected, tmpDir, logv)
+	if err != nil {
+		return fmt.Errorf("restream: %w", err)
+	}
+	for _, j := range jobs {
+		fmt.Fprintf(os.Stderr, "restream track %s\n", j.st)
+	}
+	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
+}
+
+// buildOutputs turns selected streams into a ready-to-run output: the
+// presentation (End/StatusLine), the HTTP handler that serves it, the media
+// path, and the per-stream download jobs (part files under tmpDir). It is the
+// single place that maps -serve-format onto a packager, shared by the one-shot
+// `-serve` mode and the multi-channel worker. Subtitles are skipped (no live
+// WebVTT segmentation yet).
+func buildOutputs(o options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (presentation, http.Handler, string, []job, error) {
+	var streams []*manifest.Stream
+	for _, st := range selected {
+		if st.Type == manifest.Subtitles {
+			logv("restream: skipping subtitle track %s (not supported yet)", st.ID)
+			continue
+		}
+		streams = append(streams, st)
+	}
+	if len(streams) == 0 {
+		return nil, nil, "", nil, fmt.Errorf("no video/audio streams selected")
+	}
 
 	switch o.serveFormat {
 	case "ts", "mpegts":
 		if pure := singleMuxedTS(streams); pure != nil && o.serveTranscode == "" {
 			// Source is already a muxed TS: copy segments straight out, no ffmpeg.
 			b := restream.NewTSBroadcaster()
-			pres, handler, path = b, restream.NewTSServer(b), "/live.ts"
-			jobs = []job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(pure))}}
-			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", "ts", pure)
-			break
+			jobs := []job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(pure))}}
+			return b, restream.NewTSServer(b), "/live.ts", jobs, nil
 		}
 		// fMP4 source, separate audio, or a transcode was asked for: remux with
 		// one long-lived ffmpeg feeding the broadcaster.
 		ffmpeg, err := mux.FindFFmpeg(o.ffmpegPath)
 		if err != nil {
-			return fmt.Errorf("restream ts: source needs remuxing to MPEG-TS but ffmpeg not found (pass -ffmpeg <path>): %w", err)
+			return nil, nil, "", nil, fmt.Errorf("ts output needs remuxing but ffmpeg not found (pass -ffmpeg <path>): %w", err)
 		}
 		var targs []string
 		if o.serveTranscode != "" {
@@ -95,41 +104,39 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 		b := restream.NewTSBroadcaster()
 		rem, err := restream.NewRemuxTS(ffmpeg, len(streams), targs, b, logv)
 		if err != nil {
-			return err
+			return nil, nil, "", nil, err
 		}
+		var jobs []job
 		for i, st := range streams {
 			jobs = append(jobs, job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+rawExt(st))})
-			fmt.Fprintf(os.Stderr, "restream input %-8d %s\n", i, st)
 		}
-		pres, handler, path = rem, restream.NewTSServer(b), "/live.ts"
+		return rem, restream.NewTSServer(b), "/live.ts", jobs, nil
 	case "dash", "mpd":
 		if err := requireFMP4(streams); err != nil {
-			return err
+			return nil, nil, "", nil, err
 		}
-		pub := restream.NewPublisher()
-		namer := newNamer()
-		for _, st := range streams {
-			id := namer(st)
-			sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
-			jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
-			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", id, st)
-		}
-		pres, handler, path = pub, restream.NewServer(pub).DASHHandler(), "/live.mpd"
+		pub, jobs := buildPublisherJobs(streams, tmpDir)
+		return pub, restream.NewServer(pub).DASHHandler(), "/live.mpd", jobs, nil
 	case "", "hls":
-		pub := restream.NewPublisher()
-		namer := newNamer()
-		for _, st := range streams {
-			id := namer(st)
-			sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
-			jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
-			fmt.Fprintf(os.Stderr, "restream track %-10s %s\n", id, st)
-		}
-		pres, handler, path = pub, restream.NewServer(pub).Handler(), "/live.m3u8"
+		pub, jobs := buildPublisherJobs(streams, tmpDir)
+		return pub, restream.NewServer(pub).Handler(), "/live.m3u8", jobs, nil
 	default:
-		return fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.serveFormat)
+		return nil, nil, "", nil, fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.serveFormat)
 	}
+}
 
-	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
+// buildPublisherJobs wires each stream to a track in a new Publisher (shared by
+// the HLS and DASH paths, which differ only in the handler).
+func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []job) {
+	pub := restream.NewPublisher()
+	namer := newNamer()
+	var jobs []job
+	for _, st := range streams {
+		id := namer(st)
+		sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
+		jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
+	}
+	return pub, jobs
 }
 
 // serve runs the download jobs into their sinks while an HTTP server publishes

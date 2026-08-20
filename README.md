@@ -265,6 +265,41 @@ FFmpeg); MPEG-TS output copies a TS source in pure Go and remuxes an fMP4 or
 separate-audio source through one FFmpeg (with optional transcode). TS→fMP4 for
 DASH/HLS-fMP4 output, and subtitle restreaming, are not wired up yet.
 
+## Worker mode (many channels, one process)
+
+`-serve` runs one presentation. `-worker` runs a **multi-channel restream
+agent** a controller drives over HTTP — start and stop channels on the fly, each
+served at `/{id}/…`. One process holds them all: the media is already in RAM in
+the packager, so there is no subprocess to babysit and no reverse proxy to a
+child's port.
+
+```bash
+# on the streaming server (secret required on non-loopback binds)
+m314dl -worker :7001 -worker-secret mytoken -worker-max-channels 32
+
+# start a channel (source → live HLS at /news/live.m3u8)
+curl -H 'Authorization: Bearer mytoken' -X POST http://server:7001/api/channels \
+  -d '{"id":"news","url":"https://…/manifest.mpd","format":"hls","keys":["KID:KEY"],
+       "headers":{"Referer":"https://…"}}'
+
+# ts / dash channels the same way (format: "ts" | "dash")
+# list / inspect / stop
+curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels
+curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news
+curl -H 'Authorization: Bearer mytoken' -X DELETE http://server:7001/api/channels/news
+curl -H 'Authorization: Bearer mytoken' http://server:7001/api/health
+
+# viewers just play the media URL (unauthenticated, like any origin)
+mpv http://server:7001/news/live.m3u8
+```
+
+Each channel reuses the whole engine — selection, native decrypt, live refresh,
+and the HLS/TS/DASH packagers above — so a channel is exactly a `-serve` stream
+under an id. The control plane carries the production hardening: a bearer secret,
+an admission cap (`-worker-max-channels`, 503 past it), and graceful shutdown
+that stops every channel. State is in-memory by design: the worker is stateless,
+so a controller's own reconciliation restarts channels after a restart.
+
 ## Selector syntax
 
 `-sv`, `-sa`, `-ss` accept:

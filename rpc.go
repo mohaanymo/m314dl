@@ -143,11 +143,15 @@ func (s *rpcServer) handler() http.Handler {
 	return mux
 }
 
-func (s *rpcServer) auth(h http.HandlerFunc) http.HandlerFunc {
+func (s *rpcServer) auth(h http.HandlerFunc) http.HandlerFunc { return bearerAuth(s.secret, h) }
+
+// bearerAuth wraps a handler with constant-time "Authorization: Bearer <secret>"
+// checking. An empty secret disables auth (loopback-only convenience).
+func bearerAuth(secret string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.secret != "" {
+		if secret != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.secret)) != 1 {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
