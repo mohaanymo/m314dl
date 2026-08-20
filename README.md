@@ -162,6 +162,52 @@ Output files land in the server's working directory unless `-o` gives a path.
 An authenticated client has the full power of the CLI on the server — treat
 the secret like an SSH key.
 
+## Restream: live HLS out (`-serve`)
+
+Instead of writing a file, m314dl can republish what it downloads as a **live
+HLS stream** over HTTP — decrypt a DRM source and re-serve it in the clear, pull
+one feed and fan it out to many viewers, or turn a live recording into a
+watchable endpoint.
+
+```bash
+# pull a stream and re-serve it as live HLS
+m314dl -serve :8314 https://example.com/master.m3u8
+# → http://localhost:8314/live.m3u8
+
+# decrypt a DRM DASH source and restream it in the clear
+m314dl -serve :8314 -key KID:KEY https://example.com/manifest.mpd
+```
+
+Open `http://<host>:8314/live.m3u8` in VLC, mpv, hls.js, or any HLS player.
+
+What it serves:
+
+- `GET /live.m3u8` — multivariant (master) playlist
+- `GET /{track}/index.m3u8` — a track's media playlist (`video`, `audio-en`, …)
+- `GET /{track}/init.mp4` — fMP4 init segment (EXT-X-MAP target)
+- `GET /{track}/000123.ts` — a media segment
+
+How it's built — and why it's different from an FFmpeg restreamer:
+
+- **No FFmpeg on the copy path.** Segments arrive already decrypted and in
+  playback order from the normal download engine; the packager just keeps a
+  rolling in-memory window and rewrites the playlist. No subprocess, no `-re`
+  pacing (the source's own segment cadence paces it), no TS continuity-counter
+  surgery (segments are copied whole, never re-muxed). Output segments are
+  **byte-identical** to the source.
+- **One copy feeds every viewer.** Segments are held once in a shared window and
+  served with Range/ETag support, not buffered per connection.
+- **Correct playlists.** Right `EXT-X-VERSION` for fMP4 vs TS, `EXT-X-MAP` for
+  fMP4, real `BANDWIDTH`/`CODECS`/`RESOLUTION` in the master (measured, not
+  guessed), source discontinuities passed through, and an output media sequence
+  that can't be wedged by a source that rewinds its own numbering.
+- **Live and VOD.** A live source rolls a window; a finite source publishes the
+  whole thing and caps it with `EXT-X-ENDLIST`, then keeps serving until Ctrl-C.
+
+Scope today: copy-only (same container family — TS→TS, fMP4→fMP4/CMAF), video
+and audio. Cross-container remux, continuous MPEG-TS output, and DASH output are
+planned; subtitle restreaming is not wired up yet.
+
 ## Selector syntax
 
 `-sv`, `-sa`, `-ss` accept:

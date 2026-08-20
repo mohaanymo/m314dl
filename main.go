@@ -65,6 +65,7 @@ type options struct {
 	bbtsKey          string
 	rpc              string
 	rpcSecret        string
+	serve            string
 }
 
 func main() {
@@ -102,6 +103,7 @@ func run() error {
 	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
 	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
 	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
+	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams as live HLS on this address (e.g. :8314) instead of downloading to a file; serve http://<addr>/live.m3u8")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
@@ -246,6 +248,15 @@ func run() error {
 		if k := st.Segments[0].Key; k != nil && k.Method == manifest.EncCENC && len(keys) == 0 {
 			return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
 		}
+	}
+
+	// Restream mode: republish live HLS over HTTP instead of downloading a file.
+	if o.serve != "" {
+		threadCeiling := 0
+		if tPinned {
+			threadCeiling = o.threads
+		}
+		return runRestream(ctx, o, client, kind, selected, keys, bbtsKey, threadCeiling, logv)
 	}
 
 	outPath := outputPath(o.output, inputURL, live)
