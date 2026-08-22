@@ -94,18 +94,23 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		}
 	}
 
-	// CENC: build a native decryptor if a key is available; otherwise refuse
-	// gracefully (no external mp4decrypt needed — decryption is in-process).
+	// CENC: decryption is in-process, no external mp4decrypt.
+	//
+	// Whether a stream is encrypted is decided by its init segment, not by the
+	// manifest. Packagers do omit ContentProtection — and a stream judged clear
+	// on the manifest's word has its encrypted samples copied straight through,
+	// which reaches the player as a black picture with working audio and no
+	// error raised anywhere along the way.
 	var dec *cencDecryptor
-	if streamIsCENC(st) {
-		if len(cfg.Keys) == 0 {
-			return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
-		}
+	switch {
+	case st.Init != nil && st.Init.URL != "":
 		d, err := newCencDecryptor(ctx, cfg, st)
 		if err != nil {
 			return err
 		}
-		dec = d
+		dec = d // nil when the init shows the stream is not encrypted
+	case streamIsCENC(st):
+		return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
 	}
 
 	// single-segment stream (SegmentBase / plain file): direct streaming path.
@@ -402,6 +407,14 @@ type result struct {
 
 // worker streams each segment to its part file. It does not decrypt or hold the
 // segment in memory — the writer decrypts and assembles in order.
+//
+// Restreaming keeps the part file too, even though its writer reads the whole
+// thing straight back into RAM to decrypt it. Holding those bytes in memory
+// instead was tried and reverted: the pipeline is 64 workers deep with a
+// results channel twice that, which costs nothing when the depth is measured in
+// file handles and 19 GB in one process when it is measured in segments. Point
+// the spool at a tmpfs and the writes never reach a disk anyway, with a size cap
+// the kernel enforces — which is the part an in-process buffer was missing.
 func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, items <-chan item, results chan<- result) {
 	for it := range items {
 		if err := ctl.lim.acquire(ctx); err != nil {
@@ -688,19 +701,18 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 }
 
 // readDecrypt reads a committed segment's part file, decrypts it in place, and
-// deletes the part file. Shared by both writers.
+// deletes the part file. Shared by both writers. The part file goes even when
+// the decrypt fails: a worker killed and restarted across a bad stream would
+// otherwise leave its segments behind, and 1430 of those directories once ate
+// 43 GB nobody could see.
 func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, outPath string, idx int64, it item) ([]byte, error) {
 	part := partPath(outPath, idx)
 	data, err := os.ReadFile(part)
 	if err != nil {
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)
 	}
-	data, err = decryptSegment(ctx, kc, dec, cfg.BBTSKey, it, data)
-	if err != nil {
-		return nil, err
-	}
-	os.Remove(part)
-	return data, nil
+	defer os.Remove(part)
+	return decryptSegment(ctx, kc, dec, cfg.BBTSKey, it, data)
 }
 
 // ---- single big file ----

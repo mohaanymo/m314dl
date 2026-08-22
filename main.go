@@ -22,15 +22,17 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/mohamed/m314dl/internal/dash"
 	"github.com/mohamed/m314dl/internal/engine"
 	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
 	"github.com/mohamed/m314dl/internal/mux"
 	"github.com/mohamed/m314dl/internal/pick"
-	"github.com/mohamed/m314dl/internal/scrape"
+	"github.com/mohamed/m314dl/internal/rpc"
+	"github.com/mohamed/m314dl/internal/serve"
+	"github.com/mohamed/m314dl/internal/source"
 	"github.com/mohamed/m314dl/internal/subs"
+	"github.com/mohamed/m314dl/internal/worker"
 )
 
 const version = "0.2.0"
@@ -108,14 +110,14 @@ func run() error {
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging")
 	flag.DurationVar(&o.timeout, "timeout", 0, "per-request timeout (default none; retries handle stalls)")
 	flag.DurationVar(&o.progressInterval, "progress-interval", 0, "progress refresh interval, e.g. 500ms (default: 1s on a TTY, 5s when piped)")
-	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see rpc.go for the HTTP/JSON API")
+	flag.StringVar(&o.rpc, "rpc", "", "run as an RPC server on this address (e.g. 127.0.0.1:8314) instead of downloading; see internal/rpc for the HTTP/JSON API")
 	flag.StringVar(&o.rpcSecret, "rpc-secret", "", "bearer token for -rpc clients (required when binding a non-loopback address)")
 	flag.IntVar(&o.rpcMaxJobs, "rpc-max-jobs", 64, "-rpc: max concurrent jobs; further /add requests get 503 until a slot frees (0 = unlimited)")
 	flag.DurationVar(&o.rpcRetain, "rpc-retain", time.Hour, "-rpc: keep finished jobs queryable at least this long before reaping (bounds memory)")
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
 	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source)")
 	flag.StringVar(&o.serveTranscode, "serve-transcode", "", "restream ts remux: ffmpeg output codec args to transcode instead of copy, e.g. '-c:v libx264 -preset veryfast -c:a aac' (implies the ffmpeg remux path)")
-	flag.StringVar(&o.worker, "worker", "", "run as a multi-channel restream worker on this address (e.g. :7001); drive it via POST /api/channels, serve /{id}/live.m3u8. See worker.go")
+	flag.StringVar(&o.worker, "worker", "", "run as a multi-channel restream worker on this address (e.g. :7001); drive it via POST /api/channels, serve /{id}/live.m3u8. See internal/worker")
 	flag.StringVar(&o.workerSecret, "worker-secret", "", "bearer token for -worker control API (required when binding a non-loopback address)")
 	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
@@ -139,7 +141,7 @@ func run() error {
 		if flag.NArg() != 0 {
 			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
 		}
-		return serveRPC(o.rpc, o.rpcSecret, o.rpcMaxJobs, o.rpcRetain)
+		return rpc.ServeRPC(o.rpc, o.rpcSecret, o.rpcMaxJobs, o.rpcRetain, version)
 	}
 	if o.worker != "" {
 		if flag.NArg() != 0 {
@@ -150,7 +152,7 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "[v] "+format+"\n", args...)
 			}
 		}
-		return serveWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, logv)
+		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, version, logv)
 	}
 	// Adaptive concurrency unless the user pinned -t.
 	tPinned := false
@@ -196,7 +198,7 @@ func run() error {
 		adFilters = append(adFilters, re)
 	}
 
-	keys, err := parseKeys(o.keys)
+	keys, err := source.ParseKeys(o.keys)
 	if err != nil {
 		return err
 	}
@@ -214,7 +216,7 @@ func run() error {
 	stopLive := make(chan struct{})
 
 	// fetch + detect manifest (scraping web pages transparently)
-	master, kind, err := loadManifest(ctx, client, inputURL, logv)
+	master, kind, err := source.LoadManifest(ctx, client, inputURL, logv)
 	if err != nil {
 		return err
 	}
@@ -281,7 +283,8 @@ func run() error {
 		if tPinned {
 			threadCeiling = o.threads
 		}
-		return runRestream(ctx, o, client, kind, selected, keys, bbtsKey, threadCeiling, logv)
+		return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath},
+			client, kind, selected, keys, bbtsKey, threadCeiling, logv)
 	}
 
 	outPath := outputPath(o.output, inputURL, live)
@@ -330,7 +333,7 @@ func run() error {
 	}
 	var results []done
 	for _, st := range selected {
-		results = append(results, done{st: st, path: engine.TempStreamPath(outPath, st, rawExt(st))})
+		results = append(results, done{st: st, path: engine.TempStreamPath(outPath, st, source.RawExt(st))})
 	}
 	// Stream scheduling. A stream's segments are latency-bound when small
 	// (subtitles: thousands of ~byte-sized segments) and bandwidth-bound when
@@ -357,7 +360,7 @@ func run() error {
 			stCfg.Threads = subWorkerCap
 		}
 		g.Go(func() error {
-			refresh := refreshFunc(client, kind, r.st, logv)
+			refresh := source.RefreshFunc(client, kind, r.st, logv)
 			if !r.st.Live {
 				refresh = nil
 			}
@@ -471,174 +474,9 @@ func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map
 		if extra == "" {
 			extra = st.ID
 		}
-		cand = fmt.Sprintf("%s.%s.%s.%s", base, tag, sanitizeTag(extra), format)
+		cand = fmt.Sprintf("%s.%s.%s.%s", base, tag, source.SanitizeTag(extra), format)
 	}
 	return cand
-}
-
-var tagBad = regexp.MustCompile(`[^\w.\-]+`)
-
-func sanitizeTag(s string) string { return tagBad.ReplaceAllString(s, "_") }
-
-// localManifestPath returns the filesystem path when input is a local manifest
-// (a file:// URL, or a schemeless string that names an existing file) and ok.
-func localManifestPath(input string) (string, bool) {
-	if strings.HasPrefix(input, "file://") {
-		return strings.TrimPrefix(input, "file://"), true
-	}
-	if u, err := url.Parse(input); err == nil && u.Scheme != "" {
-		return "", false // has a real URL scheme (http/https/…)
-	}
-	if _, err := os.Stat(input); err == nil {
-		return input, true
-	}
-	return "", false
-}
-
-// localBaseURL is the base against which relative segment URLs in a local
-// manifest resolve. Absolute segment URLs (the common case for signed
-// manifests) ignore it.
-func localBaseURL(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		abs = path
-	}
-	return "file://" + filepath.Dir(abs) + "/"
-}
-
-// parseKeys parses -key values into a KID→key map. Each value is "KID:KEY"
-// (hex, KID dashes optional) or a bare "KEY" (stored under the zero KID, used
-// when exactly one key is given and the KID does not match).
-func parseKeys(vals []string) (map[[16]byte][]byte, error) {
-	if len(vals) == 0 {
-		return nil, nil
-	}
-	out := map[[16]byte][]byte{}
-	for _, v := range vals {
-		kidStr, keyStr, hasKID := strings.Cut(v, ":")
-		if !hasKID {
-			kidStr, keyStr = "", v
-		}
-		key, err := hex.DecodeString(strings.TrimSpace(keyStr))
-		if err != nil || len(key) != 16 {
-			return nil, fmt.Errorf("bad -key %q: key must be 32 hex chars (16 bytes)", v)
-		}
-		var kid [16]byte
-		if hasKID {
-			k, err := hex.DecodeString(strings.ReplaceAll(strings.TrimSpace(kidStr), "-", ""))
-			if err != nil || len(k) != 16 {
-				return nil, fmt.Errorf("bad -key %q: KID must be 32 hex chars (16 bytes)", v)
-			}
-			copy(kid[:], k)
-		}
-		out[kid] = key
-	}
-	return out, nil
-}
-
-// loadManifest fetches the input, sniffs HLS/DASH, and falls back to
-// scraping when the input is a web page.
-func loadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
-	// Local manifest file (path or file://): some providers sign the playlist
-	// per request and hand it over as text rather than a URL.
-	if path, ok := localManifestPath(inputURL); ok {
-		body, err := os.ReadFile(path)
-		if err != nil {
-			return nil, "", fmt.Errorf("read manifest %s: %w", path, err)
-		}
-		base := localBaseURL(path)
-		logv("local manifest %s (base %s)", path, base)
-		switch {
-		case hls.IsHLS(body):
-			m, err := hls.ParseMaster(body, base)
-			return m, "hls", err
-		case dash.IsDASH(body):
-			m, err := dash.Parse(body, base)
-			return m, "dash", err
-		}
-		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH manifest", path)
-	}
-	body, finalURL, err := client.FetchBytes(ctx, inputURL, "")
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
-	}
-	if hls.IsHLS(body) {
-		m, err := hls.ParseMaster(body, finalURL)
-		return m, "hls", err
-	}
-	if dash.IsDASH(body) {
-		m, err := dash.Parse(body, finalURL)
-		return m, "dash", err
-	}
-	// probably a web page: scrape it
-	logv("input is not a manifest; scraping page for stream URLs")
-	candidates, err := scrape.Find(ctx, client, inputURL)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(candidates) == 0 {
-		return nil, "", fmt.Errorf("no HLS/DASH manifest found at %s (not a playlist, and page scan found no stream URLs)", inputURL)
-	}
-	for _, c := range candidates {
-		fmt.Fprintln(os.Stderr, "found stream: "+c)
-	}
-	first := candidates[0]
-	logv("using first candidate: %s", first)
-	body, finalURL, err = client.FetchBytes(ctx, first, "")
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch scraped %s: %w", first, err)
-	}
-	switch {
-	case hls.IsHLS(body):
-		m, err := hls.ParseMaster(body, finalURL)
-		return m, "hls", err
-	case dash.IsDASH(body):
-		m, err := dash.Parse(body, finalURL)
-		return m, "dash", err
-	}
-	return nil, "", fmt.Errorf("scraped URL %s is not a recognizable manifest", first)
-}
-
-func refreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv func(string, ...any)) engine.RefreshFunc {
-	return func(ctx context.Context) (*manifest.Stream, error) {
-		body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
-		if err != nil {
-			return nil, err
-		}
-		if kind == "hls" {
-			fresh := *st
-			fresh.Segments = nil
-			if err := hls.ParseMedia(body, finalURL, &fresh); err != nil {
-				return nil, err
-			}
-			return &fresh, nil
-		}
-		m, err := dash.Parse(body, finalURL)
-		if err != nil {
-			return nil, err
-		}
-		for _, cand := range m.Streams {
-			if cand.ID == st.ID {
-				return cand, nil
-			}
-		}
-		logv("live: stream %s missing from refreshed MPD", st.ID)
-		return nil, fmt.Errorf("stream %s no longer in MPD", st.ID)
-	}
-}
-
-func rawExt(st *manifest.Stream) string {
-	if st.Type == manifest.Subtitles {
-		return ".rawsub"
-	}
-	u := ""
-	if len(st.Segments) > 0 {
-		u = st.Segments[0].URL
-	}
-	if st.Init != nil || strings.Contains(u, ".m4s") || strings.Contains(u, ".mp4") {
-		return ".mp4"
-	}
-	return ".ts"
 }
 
 func outputPath(out, inputURL string, live bool) string {

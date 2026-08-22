@@ -5,7 +5,7 @@
 //     window of segments, one media playlist per track.
 //   - MPEG-TS (-serve-format ts): a single continuous transport stream fanned
 //     out to every viewer. Requires one muxed TS source track.
-package main
+package serve
 
 import (
 	"context"
@@ -26,17 +26,27 @@ import (
 	"github.com/mohamed/m314dl/internal/manifest"
 	"github.com/mohamed/m314dl/internal/mux"
 	"github.com/mohamed/m314dl/internal/restream"
+	"github.com/mohamed/m314dl/internal/source"
 )
 
-// presentation is the output-format-agnostic surface the run loop needs: how to
+// Options is the subset of the CLI flags that shapes a restream: where to
+// listen and what to publish.
+type Options struct {
+	Addr       string // listen address (-serve)
+	Format     string // hls | ts | dash (-serve-format)
+	Transcode  string // ffmpeg output args for the ts remux path (-serve-transcode)
+	FFmpegPath string // -ffmpeg
+}
+
+// Presentation is the output-format-agnostic surface the run loop needs: how to
 // finish the stream and how to describe its liveness.
-type presentation interface {
+type Presentation interface {
 	End()
 	StatusLine() string
 }
 
 // job is one source stream wired to the sink that publishes it.
-type job struct {
+type Job struct {
 	st   *manifest.Stream
 	sink engine.Sink
 	tmp  string
@@ -44,7 +54,7 @@ type job struct {
 
 // runRestream builds the output for the selected streams and hands off to the
 // blocking run loop (the one-shot `-serve` mode).
-func runRestream(ctx context.Context, o options, client *httpx.Client, kind string,
+func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
@@ -54,7 +64,7 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 	}
 	defer os.RemoveAll(tmpDir)
 
-	pres, handler, path, jobs, err := buildOutputs(o, selected, tmpDir, logv)
+	pres, handler, path, jobs, err := BuildOutputs(o, selected, tmpDir, logv)
 	if err != nil {
 		return fmt.Errorf("restream: %w", err)
 	}
@@ -65,12 +75,12 @@ func runRestream(ctx context.Context, o options, client *httpx.Client, kind stri
 }
 
 // buildOutputs turns selected streams into a ready-to-run output: the
-// presentation (End/StatusLine), the HTTP handler that serves it, the media
+// Presentation (End/StatusLine), the HTTP handler that serves it, the media
 // path, and the per-stream download jobs (part files under tmpDir). It is the
 // single place that maps -serve-format onto a packager, shared by the one-shot
 // `-serve` mode and the multi-channel worker. Subtitles are skipped (no live
 // WebVTT segmentation yet).
-func buildOutputs(o options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (presentation, http.Handler, string, []job, error) {
+func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (Presentation, http.Handler, string, []Job, error) {
 	var streams []*manifest.Stream
 	for _, st := range selected {
 		if st.Type == manifest.Subtitles {
@@ -83,32 +93,32 @@ func buildOutputs(o options, selected []*manifest.Stream, tmpDir string, logv fu
 		return nil, nil, "", nil, fmt.Errorf("no video/audio streams selected")
 	}
 
-	switch o.serveFormat {
+	switch o.Format {
 	case "ts", "mpegts":
-		if pure := singleMuxedTS(streams); pure != nil && o.serveTranscode == "" {
+		if pure := singleMuxedTS(streams); pure != nil && o.Transcode == "" {
 			// Source is already a muxed TS: copy segments straight out, no ffmpeg.
 			b := restream.NewTSBroadcaster()
-			jobs := []job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+rawExt(pure))}}
+			jobs := []Job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+source.RawExt(pure))}}
 			return b, restream.NewTSServer(b), "/live.ts", jobs, nil
 		}
 		// fMP4 source, separate audio, or a transcode was asked for: remux with
 		// one long-lived ffmpeg feeding the broadcaster.
-		ffmpeg, err := mux.FindFFmpeg(o.ffmpegPath)
+		ffmpeg, err := mux.FindFFmpeg(o.FFmpegPath)
 		if err != nil {
 			return nil, nil, "", nil, fmt.Errorf("ts output needs remuxing but ffmpeg not found (pass -ffmpeg <path>): %w", err)
 		}
 		var targs []string
-		if o.serveTranscode != "" {
-			targs = strings.Fields(o.serveTranscode)
+		if o.Transcode != "" {
+			targs = strings.Fields(o.Transcode)
 		}
 		b := restream.NewTSBroadcaster()
 		rem, err := restream.NewRemuxTS(ffmpeg, len(streams), targs, b, logv)
 		if err != nil {
 			return nil, nil, "", nil, err
 		}
-		var jobs []job
+		var jobs []Job
 		for i, st := range streams {
-			jobs = append(jobs, job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+rawExt(st))})
+			jobs = append(jobs, Job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+source.RawExt(st))})
 		}
 		return rem, restream.NewTSServer(b), "/live.ts", jobs, nil
 	case "dash", "mpd":
@@ -121,33 +131,33 @@ func buildOutputs(o options, selected []*manifest.Stream, tmpDir string, logv fu
 		pub, jobs := buildPublisherJobs(streams, tmpDir)
 		return pub, restream.NewServer(pub).Handler(), "/live.m3u8", jobs, nil
 	default:
-		return nil, nil, "", nil, fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.serveFormat)
+		return nil, nil, "", nil, fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.Format)
 	}
 }
 
 // buildPublisherJobs wires each stream to a track in a new Publisher (shared by
 // the HLS and DASH paths, which differ only in the handler).
-func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []job) {
+func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []Job) {
 	pub := restream.NewPublisher()
 	namer := newNamer()
-	var jobs []job
+	var jobs []Job
 	for _, st := range streams {
 		id := namer(st)
 		sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
-		jobs = append(jobs, job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+rawExt(st))})
+		jobs = append(jobs, Job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+source.RawExt(st))})
 	}
 	return pub, jobs
 }
 
 // serve runs the download jobs into their sinks while an HTTP server publishes
 // the result, until the source ends or the operator interrupts.
-func serve(ctx context.Context, o options, client *httpx.Client, kind string,
-	jobs []job, pres presentation, handler http.Handler, path string,
+func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
+	jobs []Job, pres Presentation, handler http.Handler, path string,
 	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
 
-	ln, err := net.Listen("tcp", o.serve)
+	ln, err := net.Listen("tcp", o.Addr)
 	if err != nil {
-		return fmt.Errorf("restream: listen on %s: %w", o.serve, err)
+		return fmt.Errorf("restream: listen on %s: %w", o.Addr, err)
 	}
 	srv := &http.Server{Handler: handler}
 	go srv.Serve(ln)
@@ -178,25 +188,7 @@ func serve(ctx context.Context, o options, client *httpx.Client, kind string,
 		pres.End()
 	}()
 
-	g, gctx := errgroup.WithContext(ctx)
-	for _, j := range jobs {
-		j := j
-		g.Go(func() error {
-			cfg := engine.Config{
-				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
-				Verbose: logv, Sink: j.sink,
-			}
-			refresh := refreshFunc(client, kind, j.st, logv)
-			if !j.st.Live {
-				refresh = nil // finite source: publish it once, then finish
-			}
-			if err := engine.DownloadStream(gctx, cfg, j.st, j.tmp, refresh); err != nil {
-				return fmt.Errorf("track %s: %w", j.st.ID, err)
-			}
-			return nil
-		})
-	}
-	err = g.Wait()
+	err = RunJobs(ctx, client, kind, jobs, keys, bbtsKey, threadCeiling, logv)
 	close(statusStop)
 	pres.End()
 
@@ -222,7 +214,34 @@ func serve(ctx context.Context, o options, client *httpx.Client, kind string,
 	return nil
 }
 
-func statusLoop(pres presentation, stop <-chan struct{}) {
+// RunJobs downloads every job's stream into its sink until the sources end or
+// ctx is cancelled. It is the shared run loop of the one-shot `-serve` mode and
+// the worker's per-channel goroutine.
+func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
+	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+
+	g, gctx := errgroup.WithContext(ctx)
+	for _, j := range jobs {
+		j := j
+		g.Go(func() error {
+			cfg := engine.Config{
+				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
+				Verbose: logv, Sink: j.sink,
+			}
+			refresh := source.RefreshFunc(client, kind, j.st, logv)
+			if !j.st.Live {
+				refresh = nil // finite source: publish it once, then finish
+			}
+			if err := engine.DownloadStream(gctx, cfg, j.st, j.tmp, refresh); err != nil {
+				return fmt.Errorf("track %s: %w", j.st.ID, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+func statusLoop(pres Presentation, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
@@ -283,7 +302,7 @@ func newNamer() func(*manifest.Stream) string {
 			base = "sub"
 		}
 		if st.Type != manifest.Video && st.Language != "" {
-			base += "-" + sanitizeTag(st.Language)
+			base += "-" + source.SanitizeTag(st.Language)
 		}
 		used[base]++
 		if used[base] == 1 {

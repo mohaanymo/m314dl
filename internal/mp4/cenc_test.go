@@ -175,7 +175,7 @@ func TestDecryptCBCSHermetic(t *testing.T) {
 	constIV := bytes.Repeat([]byte{0x11}, 16)
 	samples := []testSample{
 		{plain: bytes.Repeat([]byte{0x7E}, 16*40+7), subs: []subsample{{clear: 9, encrypted: 16*40 - 2}}},
-		{plain: bytes.Repeat([]byte{0x5D}, 16 * 10), subs: nil},
+		{plain: bytes.Repeat([]byte{0x5D}, 16*10), subs: nil},
 	}
 	cipherData := encryptCBCSPattern(key, constIV, samples, 1, 9)
 	frag := buildFragment(samples, cipherData, 0, true) // ivLen 0: constant IV

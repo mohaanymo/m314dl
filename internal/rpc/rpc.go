@@ -17,13 +17,14 @@
 //
 // Auth: "Authorization: Bearer <secret>" when -rpc-secret is set; a secret is
 // mandatory on non-loopback binds.
-package main
+package rpc
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
+
 	"fmt"
+	"github.com/mohamed/m314dl/internal/httpx"
 	"net"
 	"net/http"
 	"os"
@@ -84,7 +85,7 @@ func newRPCServer(exe, secret string, maxJobs int, retain time.Duration) *rpcSer
 	return &rpcServer{exe: exe, secret: secret, maxJobs: maxJobs, retain: retain, jobs: map[int64]*rpcJob{}}
 }
 
-func serveRPC(addr, secret string, maxJobs int, retain time.Duration) error {
+func ServeRPC(addr, secret string, maxJobs int, retain time.Duration, version string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("-rpc %q: %w", addr, err)
@@ -143,22 +144,7 @@ func (s *rpcServer) handler() http.Handler {
 	return mux
 }
 
-func (s *rpcServer) auth(h http.HandlerFunc) http.HandlerFunc { return bearerAuth(s.secret, h) }
-
-// bearerAuth wraps a handler with constant-time "Authorization: Bearer <secret>"
-// checking. An empty secret disables auth (loopback-only convenience).
-func bearerAuth(secret string, h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-		}
-		h(w, r)
-	}
-}
+func (s *rpcServer) auth(h http.HandlerFunc) http.HandlerFunc { return httpx.BearerAuth(s.secret, h) }
 
 func (s *rpcServer) add(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, rpcMaxBody)
@@ -209,7 +195,7 @@ func (s *rpcServer) add(w http.ResponseWriter, r *http.Request) {
 		s.running--
 		s.mu.Unlock()
 	}()
-	writeJSON(w, map[string]int64{"id": j.id})
+	httpx.WriteJSON(w, map[string]int64{"id": j.id})
 }
 
 func (s *rpcServer) list(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +211,7 @@ func (s *rpcServer) list(w http.ResponseWriter, r *http.Request) {
 		out[i] = j.view(false)
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
-	writeJSON(w, out)
+	httpx.WriteJSON(w, out)
 }
 
 func (s *rpcServer) detail(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +220,7 @@ func (s *rpcServer) detail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, j.view(true))
+	httpx.WriteJSON(w, j.view(true))
 }
 
 func (s *rpcServer) stop(w http.ResponseWriter, r *http.Request) {
@@ -253,14 +239,14 @@ func (s *rpcServer) stop(w http.ResponseWriter, r *http.Request) {
 	if err := j.cmd.Process.Signal(os.Interrupt); err != nil {
 		j.cmd.Process.Kill() // Windows can't deliver SIGINT; hard-stop instead
 	}
-	writeJSON(w, map[string]string{"status": "stopping"})
+	httpx.WriteJSON(w, map[string]string{"status": "stopping"})
 }
 
 func (s *rpcServer) health(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	running, total := s.running, len(s.jobs)
 	s.mu.RUnlock()
-	writeJSON(w, map[string]any{"status": "ok", "running": running, "total": total, "max": s.maxJobs})
+	httpx.WriteJSON(w, map[string]any{"status": "ok", "running": running, "total": total, "max": s.maxJobs})
 }
 
 func (s *rpcServer) byID(r *http.Request) *rpcJob {
@@ -371,11 +357,6 @@ func (j *rpcJob) view(includeLog bool) jobView {
 		v.Log = string(j.log)
 	}
 	return v
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
 }
 
 // jobWriter captures a child's combined output into its job, under the job's own

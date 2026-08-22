@@ -124,9 +124,9 @@ func newFixedController(n int) *controller {
 	return c
 }
 
-func (c *controller) addBytes(n int)      { c.bytes.Add(int64(n)) }
-func (c *controller) addErr()             { c.errs.Add(1) }
-func (c *controller) addPressure(n int)   { c.press.Add(int64(n)) }
+func (c *controller) addBytes(n int)    { c.bytes.Add(int64(n)) }
+func (c *controller) addErr()           { c.errs.Add(1) }
+func (c *controller) addPressure(n int) { c.press.Add(int64(n)) }
 
 // ctlState is the control loop's carried state, split out so the decision is a
 // pure, testable function.

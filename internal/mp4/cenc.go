@@ -195,19 +195,19 @@ func decryptTrafs(frag []byte, moof box, moofOff, mdatOff int64, mdatData []byte
 
 func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []byte, info *InitInfo, block cipher.Block) error {
 	var (
-		trunSizes            []uint32
-		trunDataOff          int64
-		haveTrun             bool
-		sencIVs              [][]byte
-		sencSubs             [][]subsample
-		haveSenc             bool
-		saizDefault          uint8
-		saizSizes            []uint8
-		haveSaiz             bool
-		saioOffsets          []int64
-		baseIsMoof           bool
-		tfhdBaseDataOff      int64
-		haveTfhdBaseDataOff  bool
+		trunSizes           []uint32
+		trunDataOff         int64
+		haveTrun            bool
+		sencIVs             [][]byte
+		sencSubs            [][]subsample
+		haveSenc            bool
+		saizDefault         uint8
+		saizSizes           []uint8
+		haveSaiz            bool
+		saioOffsets         []int64
+		baseIsMoof          bool
+		tfhdBaseDataOff     int64
+		haveTfhdBaseDataOff bool
 	)
 	traf.children(func(b box) bool {
 		switch b.typ {

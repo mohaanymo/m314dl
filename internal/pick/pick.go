@@ -106,6 +106,17 @@ func ParseExpr(s string) (*Expr, error) {
 				return nil, fmt.Errorf("bad %s=%q", k, v)
 			}
 			e.filters = append(e.filters, filter{key: k, num: float64(n * 1000)})
+		case "hmin", "hmax", "wmin", "wmax":
+			// Numeric height/width bounds. A regex on res= cannot express "up
+			// to 720p": a source publishing 768x432, 640x360 and 480x270 has
+			// nothing matching "720" at all, so a quality preference written
+			// that way silently selects no video and the viewer gets sound
+			// only. A bound picks the best variant that fits.
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("bad %s=%q", k, v)
+			}
+			e.filters = append(e.filters, filter{key: k, num: float64(n)})
 		case "segsmin", "segsmax":
 			n, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
@@ -160,6 +171,26 @@ func (e *Expr) match(st *manifest.Stream) bool {
 			val = st.Resolution()
 		case "channel":
 			val = st.Channels
+		case "hmin":
+			if st.Height > 0 && float64(st.Height) < f.num {
+				return false
+			}
+			continue
+		case "hmax":
+			if st.Height > 0 && float64(st.Height) > f.num {
+				return false
+			}
+			continue
+		case "wmin":
+			if st.Width > 0 && float64(st.Width) < f.num {
+				return false
+			}
+			continue
+		case "wmax":
+			if st.Width > 0 && float64(st.Width) > f.num {
+				return false
+			}
+			continue
 		case "bwmin":
 			if st.Bandwidth < int64(f.num) {
 				return false
@@ -321,3 +352,9 @@ func bestPerLanguage(streams []*manifest.Stream) []*manifest.Stream {
 	}
 	return out
 }
+
+// IsNone reports whether the expression asks for no stream of its kind at all
+// ("none"). Callers use it to tell "the operator wants no video" apart from "a
+// video selection that happened to match nothing" — the second is a fault, the
+// first is a choice.
+func (e *Expr) IsNone() bool { return e != nil && e.none }

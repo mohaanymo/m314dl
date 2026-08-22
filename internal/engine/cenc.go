@@ -33,7 +33,14 @@ func streamIsCENC(st *manifest.Stream) bool {
 
 // newCencDecryptor fetches and parses the stream's init segment, then resolves
 // the content key. Key resolution order: the tenc default_KID, then the
-// manifest KID, then a single bare key if exactly one was supplied.
+// manifest's KID, then a single unlabelled key.
+//
+// It returns (nil, nil) when the init segment shows the stream is not
+// encrypted, so the caller can use it to ask the question as well as to answer
+// it. The init is the authority: a manifest can omit ContentProtection while
+// the samples are plainly encrypted, and trusting the manifest alone means
+// passing encrypted samples through untouched — which plays as a black picture
+// with working audio, and reports no error anywhere.
 func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream) (*cencDecryptor, error) {
 	if st.Init == nil || st.Init.URL == "" {
 		return nil, fmt.Errorf("stream %s is CENC but has no init segment to read protection info from", st.ID)
@@ -51,7 +58,12 @@ func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream) (*ce
 		return nil, fmt.Errorf("parse init for %s: %w", st.ID, err)
 	}
 	if info == nil {
-		return nil, fmt.Errorf("stream %s is CENC but its init has no tenc protection box", st.ID)
+		// No tenc box. If the manifest claimed protection, that is a
+		// contradiction worth reporting; otherwise the stream is simply clear.
+		if streamIsCENC(st) {
+			return nil, fmt.Errorf("stream %s is CENC but its init has no tenc protection box", st.ID)
+		}
+		return nil, nil
 	}
 
 	key := resolveKey(cfg.Keys, info.DefaultKID, manifestKID(st))

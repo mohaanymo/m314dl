@@ -19,7 +19,7 @@ type Progress struct {
 	knownBytes atomic.Int64
 
 	mu       sync.Mutex
-	samples  []sample      // ring of (time, bytes) for windowed speed
+	samples  []sample // ring of (time, bytes) for windowed speed
 	live     bool
 	start    time.Time
 	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)

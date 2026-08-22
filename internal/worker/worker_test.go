@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"encoding/json"
@@ -27,7 +27,7 @@ func workerReq(t *testing.T, w *workerServer, method, path, body, auth string) *
 }
 
 func TestWorkerValidationAndAuth(t *testing.T) {
-	w := newWorkerServer("tok", 32, "", nil)
+	w := newWorkerServer("tok", 32, "", "test", nil)
 
 	if rec := workerReq(t, w, "POST", "/api/channels", `{"id":"c","url":"http://x/a.m3u8"}`, ""); rec.Code != 401 {
 		t.Fatalf("no token: got %d, want 401", rec.Code)
@@ -60,7 +60,7 @@ func TestWorkerChannelLifecycle(t *testing.T) {
 	src := httptest.NewServer(http.FileServer(http.Dir("bench/fixtures")))
 	defer src.Close()
 
-	w := newWorkerServer("", 32, "", nil)
+	w := newWorkerServer("", 32, "", "test", nil)
 	body := `{"id":"c1","url":"` + src.URL + `/hls-fmp4/media.m3u8","format":"hls"}`
 	rec := workerReq(t, w, "POST", "/api/channels", body, "")
 	if rec.Code != 200 {
@@ -111,7 +111,7 @@ func TestWorkerChannelLifecycle(t *testing.T) {
 }
 
 func TestWorkerRequiresSecretOffLoopback(t *testing.T) {
-	if err := serveWorker("0.0.0.0:0", "", 32, "", nil); err == nil || !strings.Contains(err.Error(), "worker-secret") {
+	if err := ServeWorker("0.0.0.0:0", "", 32, "", "test", nil); err == nil || !strings.Contains(err.Error(), "worker-secret") {
 		t.Fatalf("got %v, want worker-secret error", err)
 	}
 }

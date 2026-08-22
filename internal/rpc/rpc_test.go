@@ -1,4 +1,4 @@
-package main
+package rpc
 
 import (
 	"encoding/json"
@@ -159,7 +159,7 @@ func TestRPCHealth(t *testing.T) {
 }
 
 func TestRPCRequiresSecretOffLoopback(t *testing.T) {
-	if err := serveRPC("0.0.0.0:0", "", 64, time.Hour); err == nil || !strings.Contains(err.Error(), "rpc-secret") {
+	if err := ServeRPC("0.0.0.0:0", "", 64, time.Hour, "test"); err == nil || !strings.Contains(err.Error(), "rpc-secret") {
 		t.Fatalf("got %v, want rpc-secret error", err)
 	}
 }

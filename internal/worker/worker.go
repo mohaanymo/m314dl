@@ -11,11 +11,11 @@
 //	GET    /api/channels        -> [{"id":...,"state":"running",...}, ...]
 //	GET    /api/channels/{id}   -> one channel's status
 //	DELETE /api/channels/{id}   -> stop and remove
-//	GET    /api/health          -> {"channels":3,"max":32}
+//	GET    /api/health          -> {"status":"ok","channels":3,"max":32,"version":..,cpu/ram/disk/net}
 //
 // Media (unauthenticated, like any origin — access control is the controller's
 // job): GET /{id}/... routes to that channel's HLS/TS/DASH handler.
-package main
+package worker
 
 import (
 	"context"
@@ -25,25 +25,34 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
-	"github.com/mohamed/m314dl/internal/engine"
 	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
 	"github.com/mohamed/m314dl/internal/pick"
+	"github.com/mohamed/m314dl/internal/serve"
+	"github.com/mohamed/m314dl/internal/source"
 )
 
 type workerServer struct {
 	secret      string
+	version     string
 	maxChannels int
 	ffmpegPath  string
 	logv        func(string, ...any)
+
+	// spool is where channels stage segments. Each worker instance owns one and
+	// clears it on startup: a channel removes its own directory when it stops,
+	// but a killed or restarted process never gets to, and the leftovers are
+	// invisible and unbounded. One restart-heavy day left 1430 directories and
+	// 43GB behind, on the same disk the live segments were being written to.
+	spool string
 
 	mu       sync.RWMutex
 	channels map[string]*channel
@@ -55,7 +64,7 @@ type channel struct {
 	format    string
 	mediaPath string // "/{id}/live.m3u8"
 	handler   http.Handler
-	pres      presentation
+	pres      serve.Presentation
 	cancel    context.CancelFunc
 	tmpDir    string
 
@@ -68,14 +77,42 @@ type channel struct {
 
 var idOK = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
-func newWorkerServer(secret string, maxChannels int, ffmpegPath string, logv func(string, ...any)) *workerServer {
+func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string, logv func(string, ...any)) *workerServer {
 	if logv == nil {
 		logv = func(string, ...any) {}
 	}
-	return &workerServer{secret: secret, maxChannels: maxChannels, ffmpegPath: ffmpegPath, logv: logv, channels: map[string]*channel{}}
+	return &workerServer{secret: secret, version: version, maxChannels: maxChannels, ffmpegPath: ffmpegPath,
+		logv: logv, channels: map[string]*channel{}}
 }
 
-func serveWorker(addr, secret string, maxChannels int, ffmpegPath string, logv func(string, ...any)) error {
+// useSpool claims a staging directory for this worker and clears whatever a
+// previous run left in it.
+//
+// The directory is named for the address the worker listens on, so two workers
+// on one host never share or delete each other's staging area, and a restart of
+// either reclaims exactly its own leftovers.
+func (w *workerServer) useSpool(addr string) error {
+	name := "m314dl-worker-" + strings.NewReplacer(":", "_", "/", "_", ".", "_").Replace(addr)
+	dir := filepath.Join(os.TempDir(), name)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("clear spool %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create spool %s: %w", dir, err)
+	}
+	w.spool = dir
+	return nil
+}
+
+// spoolDir is where a channel stages its segments.
+func (w *workerServer) spoolDir() string {
+	if w.spool != "" {
+		return w.spool
+	}
+	return "" // os.MkdirTemp falls back to the system temp dir
+}
+
+func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, version string, logv func(string, ...any)) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("-worker %q: %w", addr, err)
@@ -85,7 +122,10 @@ func serveWorker(addr, secret string, maxChannels int, ffmpegPath string, logv f
 			return fmt.Errorf("-worker on non-loopback %q requires -worker-secret", addr)
 		}
 	}
-	w := newWorkerServer(secret, maxChannels, ffmpegPath, logv)
+	w := newWorkerServer(secret, maxChannels, ffmpegPath, version, logv)
+	if err := w.useSpool(addr); err != nil {
+		return err
+	}
 	srv := &http.Server{Addr: addr, Handler: w.handler(), ReadHeaderTimeout: 10 * time.Second}
 
 	sigCh := make(chan os.Signal, 2)
@@ -112,11 +152,11 @@ func serveWorker(addr, secret string, maxChannels int, ffmpegPath string, logv f
 
 func (w *workerServer) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/channels", bearerAuth(w.secret, w.apiStart))
-	mux.HandleFunc("GET /api/channels", bearerAuth(w.secret, w.apiList))
-	mux.HandleFunc("GET /api/channels/{id}", bearerAuth(w.secret, w.apiStatus))
-	mux.HandleFunc("DELETE /api/channels/{id}", bearerAuth(w.secret, w.apiStop))
-	mux.HandleFunc("GET /api/health", bearerAuth(w.secret, w.apiHealth))
+	mux.HandleFunc("POST /api/channels", httpx.BearerAuth(w.secret, w.apiStart))
+	mux.HandleFunc("GET /api/channels", httpx.BearerAuth(w.secret, w.apiList))
+	mux.HandleFunc("GET /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiStatus))
+	mux.HandleFunc("DELETE /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiStop))
+	mux.HandleFunc("GET /api/health", httpx.BearerAuth(w.secret, w.apiHealth))
 	mux.HandleFunc("/{id}/", w.media) // media: unauthenticated, routed to the channel
 	return mux
 }
@@ -167,7 +207,7 @@ func (w *workerServer) apiStart(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(rw, ch.view())
+	httpx.WriteJSON(rw, ch.view())
 }
 
 func (w *workerServer) apiList(rw http.ResponseWriter, r *http.Request) {
@@ -177,7 +217,7 @@ func (w *workerServer) apiList(rw http.ResponseWriter, r *http.Request) {
 		views = append(views, ch.view())
 	}
 	w.mu.RUnlock()
-	writeJSON(rw, views)
+	httpx.WriteJSON(rw, views)
 }
 
 func (w *workerServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
@@ -186,7 +226,7 @@ func (w *workerServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "no such channel", http.StatusNotFound)
 		return
 	}
-	writeJSON(rw, ch.view())
+	httpx.WriteJSON(rw, ch.view())
 }
 
 func (w *workerServer) apiStop(rw http.ResponseWriter, r *http.Request) {
@@ -202,14 +242,31 @@ func (w *workerServer) apiStop(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ch.cancel() // downloads stop; the run goroutine ends the presentation and cleans up
-	writeJSON(rw, map[string]string{"status": "stopped", "id": id})
+	httpx.WriteJSON(rw, map[string]string{"status": "stopped", "id": id})
 }
 
 func (w *workerServer) apiHealth(rw http.ResponseWriter, r *http.Request) {
 	w.mu.RLock()
 	n := len(w.channels)
 	w.mu.RUnlock()
-	writeJSON(rw, map[string]any{"status": "ok", "channels": n, "max": w.maxChannels})
+	httpx.WriteJSON(rw, healthOut{
+		Status: "ok", Channels: n, Max: w.maxChannels,
+		// The version is what tells a panel the worker is deployed at all: with
+		// none reported, its server list showed every node as "not deployed"
+		// however healthy the node actually was.
+		Version: w.version,
+		sysStat: readSysStat(),
+	})
+}
+
+// healthOut is what GET /api/health answers. sysStat is embedded, so its
+// fields sit alongside these at the top level of the object.
+type healthOut struct {
+	Status   string `json:"status"`
+	Channels int    `json:"channels"`
+	Max      int    `json:"max"`
+	Version  string `json:"version"`
+	sysStat
 }
 
 // ─── media routing ───────────────────────────────────────────────────────────
@@ -245,7 +302,7 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	if err != nil {
 		return nil, err
 	}
-	keys, err := parseKeys(req.Keys)
+	keys, err := source.ParseKeys(req.Keys)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +312,7 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	master, kind, err := loadManifest(ctx, client, req.URL, w.logv)
+	master, kind, err := source.LoadManifest(ctx, client, req.URL, w.logv)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -266,13 +323,13 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		return nil, err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "m314dl-ch-"+req.ID+"-*")
+	tmpDir, err := os.MkdirTemp(w.spoolDir(), "m314dl-ch-"+req.ID+"-*")
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	o := options{serveFormat: req.Format, serveTranscode: req.Transcode, ffmpegPath: w.ffmpegPath}
-	pres, handler, path, jobs, err := buildOutputs(o, selected, tmpDir, w.logv)
+	o := serve.Options{Format: req.Format, Transcode: req.Transcode, FFmpegPath: w.ffmpegPath}
+	pres, handler, path, jobs, err := serve.BuildOutputs(o, selected, tmpDir, w.logv)
 	if err != nil {
 		cancel()
 		os.RemoveAll(tmpDir)
@@ -314,7 +371,7 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 
 // runChannel downloads every track into its sink until the source ends or the
 // channel is stopped, then finalizes state and cleans up.
-func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *httpx.Client, kind string, keys map[[16]byte][]byte, jobs []job) {
+func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *httpx.Client, kind string, keys map[[16]byte][]byte, jobs []serve.Job) {
 	// End the presentation on cancel too, so an ffmpeg-remux writer blocked on a
 	// stalled pipe unblocks with EPIPE and the errgroup can return.
 	go func() {
@@ -322,22 +379,7 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 		ch.pres.End()
 	}()
 
-	g, gctx := errgroup.WithContext(ctx)
-	for _, j := range jobs {
-		j := j
-		g.Go(func() error {
-			cfg := engine.Config{Client: client, Keys: keys, Verbose: w.logv, Sink: j.sink}
-			refresh := refreshFunc(client, kind, j.st, w.logv)
-			if !j.st.Live {
-				refresh = nil
-			}
-			if err := engine.DownloadStream(gctx, cfg, j.st, j.tmp, refresh); err != nil {
-				return fmt.Errorf("track %s: %w", j.st.ID, err)
-			}
-			return nil
-		})
-	}
-	err := g.Wait()
+	err := serve.RunJobs(ctx, client, kind, jobs, keys, nil, 0, w.logv)
 	ch.pres.End()
 	os.RemoveAll(ch.tmpDir)
 
@@ -429,6 +471,15 @@ func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, mas
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no streams matched the selection")
 	}
+	// A video selection that matches nothing must not quietly leave an
+	// audio-only channel. It runs, every metric reads healthy, and the first
+	// person to notice is a viewer looking at a black screen — which is exactly
+	// how a quality preference of "720" against a source publishing 768x432
+	// took the picture off a live channel.
+	if wantsVideo(ve) && !hasKind(selected, manifest.Video) && hasKind(master.Streams, manifest.Video) {
+		return nil, fmt.Errorf("no video stream matched the selection; the source publishes %s "+
+			"(use -sv none for an audio-only channel)", videoSummary(master.Streams))
+	}
 	for _, st := range selected {
 		if kind == "hls" && !st.SegmentsFull {
 			body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
@@ -448,4 +499,39 @@ func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, mas
 		}
 	}
 	return selected, nil
+}
+
+// wantsVideo reports whether a video selection asks for a picture at all.
+// A nil expression means "best", which does.
+func wantsVideo(ve *pick.Expr) bool { return ve == nil || !ve.IsNone() }
+
+func hasKind(streams []*manifest.Stream, k manifest.MediaType) bool {
+	for _, st := range streams {
+		if st.Type == k {
+			return true
+		}
+	}
+	return false
+}
+
+// videoSummary lists the resolutions a source does publish, so the error names
+// the alternatives instead of only rejecting what was asked for.
+func videoSummary(streams []*manifest.Stream) string {
+	var out []string
+	seen := map[string]bool{}
+	for _, st := range streams {
+		if st.Type != manifest.Video {
+			continue
+		}
+		r := st.Resolution()
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return "no video at all"
+	}
+	return strings.Join(out, ", ")
 }

@@ -110,8 +110,8 @@ func segList(id string, n int, secs float64) *manifest.Stream {
 }
 
 func TestSegsMinDropsBumper(t *testing.T) {
-	content := segList("content", 75, 4) // 300s
-	bumper := segList("bumper", 1, 3)    // 3s ad/bumper
+	content := segList("content", 75, 4)                                      // 300s
+	bumper := segList("bumper", 1, 3)                                         // 3s ad/bumper
 	unknown := &manifest.Stream{Type: manifest.Video, ID: "hls", Height: 720} // 0 segs
 
 	e, err := ParseExpr("segsmin=2:for=all")

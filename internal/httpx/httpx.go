@@ -68,7 +68,7 @@ func New(o Options) (*Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(pu)
 	}
-	hc := &http.Client{Transport: tr, Timeout: o.Timeout}
+	hc := &http.Client{Transport: tr, Timeout: o.Timeout, CheckRedirect: noReferer}
 	if o.CookieFile != "" {
 		jar, err := loadNetscapeCookies(o.CookieFile)
 		if err != nil {
@@ -85,6 +85,31 @@ func New(o Options) (*Client, error) {
 		r = 5
 	}
 	return &Client{hc: hc, headers: headers, retries: r}, nil
+}
+
+// maxRedirects matches net/http's own default, which replacing CheckRedirect
+// would otherwise silently remove.
+const maxRedirects = 10
+
+// noReferer follows redirects without the Referer header net/http adds by itself.
+//
+// Go sets `Referer: <previous url>` on every request it makes while following a
+// redirect. Tokenized CDN URLs reject a request carrying one: a live DASH
+// manifest behind Akamai answers 200 when fetched directly and 403 through Go's
+// redirect, from the same address, the same second, with otherwise identical
+// headers. The failure looks nothing like its cause — the 403 body parses as a
+// manifest with no PSSH, so a DRM source simply never finds a key, and a clear
+// one reports the source as unavailable.
+//
+// A downloader has no business inventing a Referer the caller did not set, so
+// this is unconditional. Any header the caller did set is still carried through
+// the redirect.
+func noReferer(req *http.Request, via []*http.Request) error {
+	req.Header.Del("Referer")
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	return nil
 }
 
 // Do sends a request with default headers applied.
