@@ -328,8 +328,9 @@ func run() error {
 	}
 
 	type done struct {
-		st   *manifest.Stream
-		path string
+		st     *manifest.Stream
+		path   string
+		failed bool // a subtitle whose download failed — skipped, not fatal
 	}
 	var results []done
 	for _, st := range selected {
@@ -365,6 +366,15 @@ func run() error {
 				refresh = nil
 			}
 			if err := engine.DownloadStream(gctx, stCfg, r.st, r.path, refresh); err != nil {
+				// Subtitles are optional: a broken track (Disney+ ships dummy
+				// placeholder subtitle tracks, some CDNs 404 a language) must not
+				// sink a finished video+audio download. Skip it with a warning.
+				// Video/audio failures stay fatal — there's no output without them.
+				if r.st.Type == manifest.Subtitles {
+					r.failed = true
+					fmt.Fprintf(os.Stderr, "warning: subtitle %s failed to download (%v); skipping it\n", r.st.ID, err)
+					return nil
+				}
 				return fmt.Errorf("stream %s: %w", r.st.ID, err)
 			}
 			return nil
@@ -385,6 +395,9 @@ func run() error {
 	wentExternal := map[string]bool{} // raw paths whose subtitle became a sidecar
 	subSidecars := map[string]bool{}  // sidecar paths already used (collision guard)
 	for _, r := range results {
+		if r.failed {
+			continue // subtitle that failed to download — already warned
+		}
 		if r.st.Type != manifest.Subtitles {
 			muxInputs = append(muxInputs, mux.Input{
 				Path: r.path, Type: r.st.Type, Language: r.st.Language,
