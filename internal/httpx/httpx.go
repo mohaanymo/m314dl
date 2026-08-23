@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strconv"
@@ -75,6 +76,13 @@ func New(o Options) (*Client, error) {
 			return nil, err
 		}
 		hc.Jar = jar
+	} else {
+		// In-memory jar so a Set-Cookie on the manifest is carried to the
+		// segment requests. Disney+ hands out an `hdntl` auth cookie on the
+		// manifest response and every segment 403s without it — the manifest
+		// is fetched first through this same client, so the cookie is already
+		// stored by the time segments download.
+		hc.Jar, _ = cookiejar.New(nil)
 	}
 	headers := map[string]string{"User-Agent": DefaultUA}
 	for k, v := range o.Headers {

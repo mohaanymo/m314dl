@@ -73,3 +73,31 @@ func TestFetchBytesPermanentNoRetry(t *testing.T) {
 		t.Fatalf("404 should not retry: %d requests", n)
 	}
 }
+
+func TestCarriesManifestCookieToSegments(t *testing.T) {
+	// Disney+ sets an auth cookie on the manifest that segments require. The
+	// default (no -cookies file) client must carry it across requests.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/manifest.mpd" {
+			http.SetCookie(w, &http.Cookie{Name: "hdntl", Value: "tok"})
+			w.Write([]byte("ok"))
+			return
+		}
+		if c, err := r.Cookie("hdntl"); err != nil || c.Value != "tok" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Write([]byte("seg"))
+	}))
+	defer srv.Close()
+	c, err := New(Options{Retries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.FetchBytes(context.Background(), srv.URL+"/manifest.mpd", ""); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	if _, _, err := c.FetchBytes(context.Background(), srv.URL+"/seg/init.mp4", ""); err != nil {
+		t.Fatalf("segment 403 — cookie not carried: %v", err)
+	}
+}
