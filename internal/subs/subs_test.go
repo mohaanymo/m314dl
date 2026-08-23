@@ -2,6 +2,7 @@ package subs
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -29,6 +30,25 @@ func TestVTTConcatDedupe(t *testing.T) {
 	}
 	if cues[0].Text != "hello" || cues[2].Text != "again" {
 		t.Fatalf("cues = %+v", cues)
+	}
+}
+
+func TestVTTStripsTagsAndEntities(t *testing.T) {
+	// OSN: <c.white> cue tags; dsnp_ar: &rlm; entity — both must be gone.
+	vtt := "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<c.white>hello</c>\n\n" +
+		"00:00:03.000 --> 00:00:04.000\n&rlm;مرحبا &amp; more\n"
+	cues := parseVTT(vtt)
+	if len(cues) != 2 {
+		t.Fatalf("cues = %d, want 2: %+v", len(cues), cues)
+	}
+	if cues[0].Text != "hello" {
+		t.Fatalf("tag not stripped: %q", cues[0].Text)
+	}
+	if strings.Contains(cues[1].Text, "&rlm;") || strings.Contains(cues[1].Text, "&amp;") {
+		t.Fatalf("entities not decoded: %q", cues[1].Text)
+	}
+	if cues[1].Text != "‏مرحبا & more" {   // &rlm; → U+200F, &amp; → &
+		t.Fatalf("cue1 = %q", cues[1].Text)
 	}
 }
 

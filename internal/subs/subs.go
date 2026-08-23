@@ -97,8 +97,13 @@ func parseVTT(text string) []Cue {
 			body = append(body, l)
 			i = j
 		}
+		// Strip WebVTT cue tags (<c.white>, <v Speaker>, inline <00:00.000>
+		// timestamps, …) and decode entities (&rlm;, &amp;, …) — SRT has no
+		// concept of either, so left in they show up as literal garbage in the
+		// player. Same normalisation the TTML path already does.
 		txt := strings.TrimSpace(strings.Join(body, "\n"))
-		if txt != "" && end > start {
+		txt = html.UnescapeString(tagRe.ReplaceAllString(txt, ""))
+		if txt = strings.TrimSpace(txt); txt != "" && end > start {
 			cues = append(cues, Cue{start, end, txt})
 		}
 	}
