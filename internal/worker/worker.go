@@ -255,18 +255,15 @@ func (w *workerServer) apiHealth(rw http.ResponseWriter, r *http.Request) {
 		// none reported, its server list showed every node as "not deployed"
 		// however healthy the node actually was.
 		Version: w.version,
-		sysStat: readSysStat(),
 	})
 }
 
-// healthOut is what GET /api/health answers. sysStat is embedded, so its
-// fields sit alongside these at the top level of the object.
+// healthOut is what GET /api/health answers.
 type healthOut struct {
 	Status   string `json:"status"`
 	Channels int    `json:"channels"`
 	Max      int    `json:"max"`
 	Version  string `json:"version"`
-	sysStat
 }
 
 // ─── media routing ───────────────────────────────────────────────────────────
