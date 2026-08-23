@@ -154,6 +154,24 @@ func TestSegmentList(t *testing.T) {
 	}
 }
 
+func TestSegmentBaseInit(t *testing.T) {
+	// SegmentBase must split off the init header so a CENC stream can read its
+	// tenc; the media segment starts after the init range (no double download).
+	mpd := `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><Representation id="v" bandwidth="1"><BaseURL>media.mp4</BaseURL><SegmentBase indexRange="1571-9138"><Initialization range="0-1570"/></SegmentBase></Representation></AdaptationSet></Period></MPD>`
+	m, err := Parse([]byte(mpd), "https://ex.com/d/x.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := m.Streams[0]
+	if st.Init == nil || st.Init.Range == nil || st.Init.Range.End != 1570 {
+		t.Fatalf("init = %+v", st.Init)
+	}
+	if len(st.Segments) != 1 || st.Segments[0].Range == nil ||
+		st.Segments[0].Range.Start != 1571 || st.Segments[0].Range.End != -1 {
+		t.Fatalf("seg = %+v", st.Segments)
+	}
+}
+
 func TestISODuration(t *testing.T) {
 	if d := parseISODuration("PT1H2M3.5S"); d != 3723.5 {
 		t.Fatalf("d = %v", d)

@@ -285,10 +285,21 @@ func buildSegments(c segCtx) ([]manifest.Segment, *manifest.InitMap, error) {
 	case list != nil:
 		return segmentsFromList(c, list)
 	case c.rep.SegmentBase != nil:
-		// ponytail: whole file as one segment, no sidx split; parallel range
-		// splitting happens in the engine for big single files
+		// Whole file as one segment, no sidx split. But split off the init header
+		// (<Initialization range="0-N">) as a separate init item so a CENC stream
+		// can read its tenc/KID — without it the decryptor never runs and every
+		// encrypted SegmentBase track dies with "stream is CENC-protected". The
+		// media segment then starts AFTER the init range, so the header isn't
+		// downloaded twice (the engine writes the init item, then the segment).
+		seg := manifest.Segment{URL: c.base, Duration: c.periodDur}
 		var init *manifest.InitMap
-		return []manifest.Segment{{URL: c.base, Duration: c.periodDur}}, init, nil
+		if sb := c.rep.SegmentBase; sb.Initialization != nil {
+			if r := parseRange(sb.Initialization.Range); r != nil {
+				init = &manifest.InitMap{URL: c.base, Range: r}
+				seg.Range = &manifest.ByteRange{Start: r.End + 1, End: -1}
+			}
+		}
+		return []manifest.Segment{seg}, init, nil
 	default:
 		return []manifest.Segment{{URL: c.base, Duration: c.periodDur}}, nil, nil
 	}
