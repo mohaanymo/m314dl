@@ -26,6 +26,7 @@ import (
 	"github.com/mohamed/m314dl/internal/bbts"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mp4"
 )
 
 type Config struct {
@@ -444,6 +445,9 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsK
 		if err := dec.decrypt(data); err != nil {
 			return nil, fmt.Errorf("CENC decrypt: %w", err)
 		}
+		// samples are now plaintext — drop senc/saiz/saio so nothing downstream
+		// treats the fragment as still encrypted
+		data = mp4.StripFragmentProtection(data)
 	}
 	if it.key != nil && it.key.Method == manifest.EncAES128 {
 		key, err := kc.get(ctx, it.key.URI)
@@ -468,6 +472,11 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsK
 			return nil, fmt.Errorf("BBTS decrypt: %w", err)
 		}
 		data = out
+	}
+	// CENC init: de-protect it (encv→avc1, drop sinf/pssh) so the muxed or raw
+	// output isn't flagged encrypted over now-plaintext samples.
+	if it.isInit && dec != nil {
+		data = mp4.SanitizeInit(data)
 	}
 	return data, nil
 }
