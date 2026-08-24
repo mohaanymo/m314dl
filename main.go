@@ -125,26 +125,33 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
 		flag.PrintDefaults()
 	}
-	// Accept the input as the first arg (N_m3u8DL-RE style) as well as last:
-	// Go's flag package stops at the first non-flag, so rotate a leading
-	// non-flag token to the end before parsing.
-	args := os.Args[1:]
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		args = append(append([]string{}, args[1:]...), args[0])
+	// Flags may appear in any order relative to the URL. Go's flag package stops
+	// at the first non-flag arg, so parse in a loop: keep the positional it stops
+	// on and resume parsing the rest. Flags before, after, or around the URL all
+	// work (m314dl -o out.mp4 URL -t 16 is the same as m314dl URL -o out.mp4 -t 16).
+	var positionals []string
+	rest := os.Args[1:]
+	for {
+		flag.CommandLine.Parse(rest)
+		rest = flag.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positionals = append(positionals, rest[0])
+		rest = rest[1:]
 	}
-	flag.CommandLine.Parse(args)
 	if *showVersion {
 		fmt.Println("m314dl", version)
 		return nil
 	}
 	if o.rpc != "" {
-		if flag.NArg() != 0 {
+		if len(positionals) != 0 {
 			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
 		}
 		return rpc.ServeRPC(o.rpc, o.rpcSecret, o.rpcMaxJobs, o.rpcRetain, version)
 	}
 	if o.worker != "" {
-		if flag.NArg() != 0 {
+		if len(positionals) != 0 {
 			return fmt.Errorf("-worker takes no URL; start channels via POST /api/channels")
 		}
 		logv := func(format string, args ...any) {
@@ -161,11 +168,11 @@ func run() error {
 			tPinned = true
 		}
 	})
-	if flag.NArg() != 1 {
+	if len(positionals) != 1 {
 		flag.Usage()
 		return fmt.Errorf("exactly one URL required")
 	}
-	inputURL := flag.Arg(0)
+	inputURL := positionals[0]
 
 	logv := func(format string, args ...any) {
 		if o.verbose {
