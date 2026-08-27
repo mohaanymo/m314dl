@@ -2,6 +2,7 @@ package mp4
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -32,6 +33,24 @@ func TestStripFragmentProtection(t *testing.T) {
 	}
 	if len(out) >= len(frag) {
 		t.Fatal("nothing was removed")
+	}
+
+	// The regression: shrinking the moof shifts the mdat earlier, so trun's
+	// data_offset must drop by exactly the bytes removed, or the demuxer reads
+	// samples from the wrong place. Original data_offset here is 100 (set above).
+	const origOff = 100
+	var newOff int32
+	walk(out, func(b box) bool {
+		if b.typ == "moof" {
+			if trun, ok := find(b.payload, "traf", "trun"); ok {
+				newOff = int32(binary.BigEndian.Uint32(trun.payload[8:12]))
+			}
+		}
+		return true
+	})
+	removed := len(frag) - len(out) // only senc/saiz/saio were dropped
+	if int(origOff-newOff) != removed {
+		t.Fatalf("trun data_offset dropped by %d, want %d (bytes removed from moof)", origOff-newOff, removed)
 	}
 }
 

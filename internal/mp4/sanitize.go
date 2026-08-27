@@ -41,10 +41,19 @@ func rebuildSeq(buf []byte, fn func(b box) ([]byte, bool)) []byte {
 
 // StripFragmentProtection removes senc/saiz/saio from every traf, so a fragment
 // whose samples are already decrypted is no longer flagged as encrypted.
+//
+// Removing those boxes shrinks the moof, which shifts the following mdat earlier.
+// trun's data_offset is measured from the moof start (default-base-is-moof), so
+// every trun's data_offset must drop by the number of bytes removed, or the
+// demuxer reads samples from the wrong place and the picture is garbage.
 func StripFragmentProtection(frag []byte) []byte {
 	return rebuildSeq(frag, func(b box) ([]byte, bool) {
 		if b.typ != "moof" {
 			return nil, false
+		}
+		removed := removedProtectionBytes(b.payload)
+		if removed == 0 {
+			return nil, false // nothing to strip; leave the moof byte-identical
 		}
 		return emitBox("moof", rebuildSeq(b.payload, func(c box) ([]byte, bool) {
 			if c.typ != "traf" {
@@ -54,11 +63,50 @@ func StripFragmentProtection(frag []byte) []byte {
 				switch d.typ {
 				case "senc", "saiz", "saio":
 					return nil, true // drop
+				case "trun":
+					return patchTrunDataOffset(d, removed), true
 				}
 				return nil, false
 			})), true
 		})), true
 	})
+}
+
+// removedProtectionBytes sums the on-disk size of the senc/saiz/saio boxes in a
+// moof — the amount the mdat shifts once they're gone.
+func removedProtectionBytes(moofPayload []byte) int {
+	total := 0
+	walk(moofPayload, func(tf box) bool {
+		if tf.typ != "traf" {
+			return true
+		}
+		walk(tf.payload, func(d box) bool {
+			switch d.typ {
+			case "senc", "saiz", "saio":
+				total += int(d.hdrLen) + len(d.payload)
+			}
+			return true
+		})
+		return true
+	})
+	return total
+}
+
+// patchTrunDataOffset subtracts removed from a trun's data_offset field (present
+// only when the data-offset flag is set, which is the fragmented norm). Layout:
+// version+flags(4), sample_count(4), data_offset(4, signed).
+func patchTrunDataOffset(trun box, removed int) []byte {
+	p := append([]byte(nil), trun.payload...)
+	if len(p) < 12 {
+		return emitBox("trun", p)
+	}
+	flags := uint32(p[1])<<16 | uint32(p[2])<<8 | uint32(p[3])
+	if flags&0x000001 == 0 {
+		return emitBox("trun", p) // no absolute data_offset to fix
+	}
+	off := int32(binary.BigEndian.Uint32(p[8:12]))
+	binary.BigEndian.PutUint32(p[8:12], uint32(off-int32(removed)))
+	return emitBox("trun", p)
 }
 
 // SanitizeInit de-protects an init segment: each encv/enca sample entry becomes
