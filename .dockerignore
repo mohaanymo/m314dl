@@ -1,0 +1,8 @@
+.git/
+dist/
+Logs/
+m314dl
+*.tar.gz
+*.zip
+RELEASE_NOTES.md
+fix-msgs.py
