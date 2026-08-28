@@ -1,0 +1,41 @@
+# docker-compose for m314dl in server mode — the shape that makes sense in
+# Portainer (a long-running service, not a one-shot command).
+#
+# This runs the RPC server: it stays up, and you submit download jobs to it
+# over HTTP. Change the `command:` line to run -serve or -worker instead
+# (examples below).
+#
+# Deploy in Portainer: Stacks -> Add stack -> paste this (or point it at the
+# repo). Then edit the secret and the published port to taste.
+
+services:
+  m314dl:
+    build: .                 # builds the image from this repo's Dockerfile
+    # image: m314dl:latest   # ...or use a pre-built image instead of build:
+    restart: unless-stopped
+    ports:
+      - "8314:8314"          # host:container — reach the API on host port 8314
+    volumes:
+      - ./downloads:/data    # finished files land here on the host
+    # RPC server: submit jobs with
+    #   curl -H 'Authorization: Bearer CHANGE_ME' -X POST \
+    #     http://HOST:8314/add -d '{"url":"https://.../master.m3u8","args":["-o","movie.mp4"]}'
+    command: >
+      -rpc 0.0.0.0:8314
+      -rpc-secret CHANGE_ME
+      -rpc-max-jobs 64
+
+    # --- Alternatives (replace the command: block above) ---
+    #
+    # Live restream (one source out as HLS/TS/DASH on :8314):
+    #   command: >
+    #     -serve :8314
+    #     -key KID:KEY
+    #     https://example.com/manifest.mpd
+    #   # then open http://HOST:8314/live.m3u8 in a player
+    #
+    # Multi-channel restream agent (controller starts/stops channels):
+    #   command: >
+    #     -worker :8314
+    #     -worker-secret CHANGE_ME
+    #     -worker-max-channels 32
