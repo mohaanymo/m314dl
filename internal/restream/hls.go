@@ -38,6 +38,14 @@ const (
 	subsGroup  = "subs"
 )
 
+// maxWindowBytes bounds a VOD track's in-memory segment window. A VOD keeps the
+// whole seekable playlist, but a long asset would otherwise grow the window
+// without limit and OOM the process; past this budget the oldest segments are
+// evicted and the playlist becomes a sliding DVR window. A var (not const) so
+// tests can shrink it. ponytail: fixed 256 MiB/track; make it a flag if
+// operators need deeper seek.
+var maxWindowBytes int64 = 256 << 20
+
 // Publisher holds every track of one live presentation and renders its
 // playlists. Tracks are added once at startup, then only their segment windows
 // change, so the track list itself needs no lock after setup.
@@ -156,6 +164,7 @@ type Track struct {
 	init        []byte
 	initAt      time.Time
 	segs        []*segment
+	winBytes    int64 // total bytes held in segs, for the VOD memory cap
 	targetDur   float64
 	seq         int64 // output media sequence of the next segment (monotonic; never reset)
 	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
@@ -236,17 +245,34 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 		data: append([]byte(nil), data...), at: time.Now(),
 	}
 	t.segs = append(t.segs, seg)
+	t.winBytes += int64(len(seg.data))
 	t.seq++
 	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
 
 	// Live: trim beyond window+tail; the tail keeps just-evicted segments
 	// fetchable a moment longer for clients mid-download of the oldest visible
-	// one. VOD: keep everything so the finished playlist is seekable end to end.
+	// one. VOD: keep the whole seekable playlist, but never past maxWindowBytes —
+	// a long asset then slides its window instead of exhausting memory. Evicted
+	// slots are nilled so their segment data can be garbage-collected (a bare
+	// reslice would pin it in the backing array).
 	if max := windowSize + tailExtra; t.live && len(t.segs) > max {
-		t.segs = t.segs[len(t.segs)-max:]
+		t.evictOldestLocked(len(t.segs) - max)
+	}
+	for !t.live && len(t.segs) > windowSize && t.winBytes > maxWindowBytes {
+		t.evictOldestLocked(1)
 	}
 	return nil
+}
+
+// evictOldestLocked drops the n oldest segments from the window, updating the
+// byte total and releasing them for GC. Caller holds t.mu.
+func (t *Track) evictOldestLocked(n int) {
+	for i := 0; i < n; i++ {
+		t.winBytes -= int64(len(t.segs[i].data))
+		t.segs[i] = nil
+	}
+	t.segs = t.segs[n:]
 }
 
 // visibleLocked returns the segments that belong in the published playlist:

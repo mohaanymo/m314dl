@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
@@ -292,5 +293,50 @@ func TestProgressTotalUpfront(t *testing.T) {
 	}
 	if prog.total.Load() != 5 || prog.done.Load() != 5 {
 		t.Fatalf("final total/done = %d/%d, want 5/5", prog.total.Load(), prog.done.Load())
+	}
+}
+
+type countingSink struct{ n atomic.Int64 }
+
+func (s *countingSink) Init([]byte) error { return nil }
+func (s *countingSink) Segment(SegmentInfo, []byte) error {
+	s.n.Add(1)
+	return nil
+}
+
+// PaceRealtime holds a finite restream to the source's real duration after a
+// short prime burst, so a VOD can't flood the live output. A lower-bound timing
+// check: the paced segments cannot finish faster than their own durations.
+func TestSinkWriterPaceRealtime(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "[%s]", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	const n = 8
+	const dur = 0.05 // seconds/segment
+	st := &manifest.Stream{ID: "t", Type: manifest.Video}
+	for i := 0; i < n; i++ {
+		st.Segments = append(st.Segments, manifest.Segment{
+			URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: dur,
+		})
+	}
+	client, _ := httpx.New(httpx.Options{})
+	sink := &countingSink{}
+
+	start := time.Now()
+	err := DownloadStream(context.Background(),
+		Config{Client: client, Threads: 4, Sink: sink, PaceRealtime: true},
+		st, filepath.Join(t.TempDir(), "o"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sink.n.Load() != n {
+		t.Fatalf("emitted %d segments, want %d", sink.n.Load(), n)
+	}
+	// The prime burst is free; the rest are paced to dur each.
+	wantMin := time.Duration(float64(n-pacePrimeSegments) * dur * float64(time.Second))
+	if got := time.Since(start); got < wantMin {
+		t.Fatalf("paced run took %v, want at least %v", got, wantMin)
 	}
 }

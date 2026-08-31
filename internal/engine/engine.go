@@ -40,6 +40,12 @@ type Config struct {
 	FromStart bool            // live: download the whole DVR window instead of starting at the edge
 	Progress  *Progress       // shared across streams; may be nil
 	Verbose   func(format string, args ...any)
+	// PaceRealtime throttles a Sink restream to the source's real playback rate.
+	// A finite (VOD) source otherwise downloads flat-out and floods the live
+	// output — overrunning a TS viewer's buffer or piling the whole asset into the
+	// packager window at once. A live source already paces itself, so leave this
+	// off there.
+	PaceRealtime bool
 	// Sink, when non-nil, receives ordered decrypted segments instead of a file
 	// (live restreaming). The download pipeline is otherwise identical — same
 	// feeder, workers, decryption, and strict in-order commit — so restreaming
@@ -688,6 +694,11 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 // sinkWriter commits segments to a Sink (live restreaming) instead of a file:
 // same ordering and hole tolerance, no output file, no resume checkpoint.
 func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+	var (
+		paceStart  time.Time     // wall clock when realtime pacing began
+		mediaClock time.Duration // media time emitted since pacing began
+		emitted    int           // segments emitted (for the prime burst)
+	)
 	commit := func(idx int64, p pend) error {
 		if p.hole {
 			return nil
@@ -704,10 +715,42 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 			info.Duration = p.it.seg.Duration
 			info.Discontinuity = p.it.seg.Discontinuity
 		}
-		return cfg.Sink.Segment(info, data)
+		if err := cfg.Sink.Segment(info, data); err != nil {
+			return err
+		}
+		// Pace a finite restream to real time: emit a short prime burst so players
+		// start without waiting, then hold each further segment to its own duration.
+		// Emitting in order here means the sleep backpressures the whole pipeline
+		// down to the source's natural rate — the download stops racing ahead, so
+		// the live output never floods. A live source is already paced; skip it.
+		if cfg.PaceRealtime && info.Duration > 0 {
+			emitted++
+			if emitted <= pacePrimeSegments {
+				return nil
+			}
+			if paceStart.IsZero() {
+				paceStart = time.Now()
+			}
+			mediaClock += time.Duration(info.Duration * float64(time.Second))
+			if d := time.Until(paceStart.Add(mediaClock)); d > 0 {
+				timer := time.NewTimer(d)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				}
+			}
+		}
+		return nil
 	}
 	return commitInOrder(cfg, live, state, results, commit, nil)
 }
+
+// pacePrimeSegments is how many segments a paced restream emits back-to-back
+// before throttling to real time, so a joining player fills its buffer at once
+// instead of waiting one segment-duration per segment for playback to start.
+const pacePrimeSegments = 3
 
 // readDecrypt reads a committed segment's part file, decrypts it in place, and
 // deletes the part file. Shared by both writers. The part file goes even when

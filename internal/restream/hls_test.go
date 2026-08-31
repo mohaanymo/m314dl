@@ -255,3 +255,38 @@ func TestServeEndpoints(t *testing.T) {
 		t.Fatalf("unknown track should 404, got %d", rec.Code)
 	}
 }
+
+// A VOD track keeps the full playlist only until maxWindowBytes; past it the
+// oldest segments are evicted (sliding DVR window) so a long asset can't OOM.
+func TestTrackVODWindowByteCap(t *testing.T) {
+	old := maxWindowBytes
+	maxWindowBytes = 1000
+	defer func() { maxWindowBytes = old }()
+
+	st := &manifest.Stream{ID: "v", Type: manifest.Video, Segments: []manifest.Segment{{URL: "x.ts"}}}
+	tr := TrackFromStream("video", st, false) // false = VOD (keep-all, until the cap)
+	for i := 0; i < 30; i++ {
+		if err := tr.Segment(engine.SegmentInfo{Duration: 2}, make([]byte, 200)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	if len(tr.segs) >= 30 {
+		t.Fatalf("VOD window never trimmed: %d segments held", len(tr.segs))
+	}
+	if len(tr.segs) > windowSize && tr.winBytes > maxWindowBytes {
+		t.Fatalf("window over budget: %d bytes in %d segments, cap %d", tr.winBytes, len(tr.segs), maxWindowBytes)
+	}
+	if tr.segs[0].seq == 0 {
+		t.Fatal("oldest segment not evicted: first seq still 0")
+	}
+	var sum int64
+	for _, s := range tr.segs {
+		sum += int64(len(s.data))
+	}
+	if sum != tr.winBytes {
+		t.Fatalf("winBytes bookkeeping off: tracked %d, actual %d", tr.winBytes, sum)
+	}
+}

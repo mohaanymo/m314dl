@@ -227,6 +227,9 @@ func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 			cfg := engine.Config{
 				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
 				Verbose: logv, Sink: j.sink,
+				// A finite source downloads flat-out; pace it to real time so it
+				// doesn't flood the live output (TS viewer buffers, packager window).
+				PaceRealtime: !j.st.Live,
 			}
 			refresh := source.RefreshFunc(client, kind, j.st, logv)
 			if !j.st.Live {
