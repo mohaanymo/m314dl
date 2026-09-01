@@ -27,6 +27,7 @@ import (
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
 	"github.com/mohamed/m314dl/internal/mp4"
+	"github.com/mohamed/m314dl/internal/sampleaes"
 )
 
 type Config struct {
@@ -95,12 +96,6 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	if cfg.Verbose == nil {
 		cfg.Verbose = func(string, ...any) {}
 	}
-	for _, seg := range st.Segments {
-		if seg.Key != nil && seg.Key.Method == manifest.EncSampleAES {
-			return fmt.Errorf("stream %s uses SAMPLE-AES encryption (not supported yet)", st.ID)
-		}
-	}
-
 	// CENC: decryption is in-process, no external mp4decrypt.
 	//
 	// Whether a stream is encrypted is decided by its init segment, not by the
@@ -111,6 +106,8 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	var dec *cencDecryptor
 	switch {
 	case st.Init != nil && st.Init.URL != "":
+		// fMP4, including fMP4 SAMPLE-AES (which is the cbcs CENC scheme): the
+		// init segment's tenc/schm decides the scheme and the CENC path handles it.
 		d, err := newCencDecryptor(ctx, cfg, st)
 		if err != nil {
 			return err
@@ -118,6 +115,15 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		dec = d // nil when the init shows the stream is not encrypted
 	case streamIsCENC(st):
 		return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
+	}
+
+	// Transport-stream SAMPLE-AES (no init) needs a content key up front, like
+	// CENC. Fail fast with a clear message instead of downloading every segment
+	// and only then failing to decrypt.
+	if dec == nil {
+		if k := firstSampleAESKey(st); k != nil && !fetchableKeyURI(k.URI) && resolveKey(cfg.Keys, k.KID) == nil {
+			return fmt.Errorf("stream %s uses SAMPLE-AES encryption; supply the content key with -key <hex-key>", st.ID)
+		}
 	}
 
 	// single-segment stream (SegmentBase / plain file): direct streaming path.
@@ -445,15 +451,36 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 
 // decryptSegment applies the same in-place transforms the old inline path did,
 // in the same order: strip fake image header, then CENC, then AES-128, then BBTS.
-func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsKey []byte, it item, data []byte) ([]byte, error) {
+func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsKey []byte, keys map[[16]byte][]byte, it item, data []byte) ([]byte, error) {
 	data = stripFakeImageHeader(data)
-	if !it.isInit && dec != nil && it.key != nil && it.key.Method == manifest.EncCENC {
+	// fMP4 CENC and fMP4 SAMPLE-AES (== cbcs) both decrypt through the CENC path;
+	// the init's tenc/schm already selected the scheme when dec was built.
+	if !it.isInit && dec != nil && it.key != nil &&
+		(it.key.Method == manifest.EncCENC || it.key.Method == manifest.EncSampleAES) {
 		if err := dec.decrypt(data); err != nil {
 			return nil, fmt.Errorf("CENC decrypt: %w", err)
 		}
 		// samples are now plaintext — drop senc/saiz/saio so nothing downstream
 		// treats the fragment as still encrypted
 		data = mp4.StripFragmentProtection(data)
+	}
+	// Transport-stream SAMPLE-AES (no fMP4 init): decrypt the elementary streams
+	// per Apple's spec and re-emit a clean TS.
+	if !it.isInit && dec == nil && it.key != nil && it.key.Method == manifest.EncSampleAES {
+		key, err := sampleAESKey(ctx, kc, keys, it.key)
+		if err != nil {
+			return nil, err
+		}
+		iv := it.key.IV
+		if iv == nil {
+			iv = make([]byte, 16)
+			binary.BigEndian.PutUint64(iv[8:], uint64(it.seq))
+		}
+		out, err := sampleaes.Decrypt(data, key, iv)
+		if err != nil {
+			return nil, fmt.Errorf("SAMPLE-AES decrypt: %w", err)
+		}
+		data = out
 	}
 	if it.key != nil && it.key.Method == manifest.EncAES128 {
 		key, err := kc.get(ctx, it.key.URI)
@@ -764,7 +791,7 @@ func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecrypt
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)
 	}
 	defer os.Remove(part)
-	return decryptSegment(ctx, kc, dec, cfg.BBTSKey, it, data)
+	return decryptSegment(ctx, kc, dec, cfg.BBTSKey, cfg.Keys, it, data)
 }
 
 // ---- single big file ----

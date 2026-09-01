@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/mohamed/m314dl/internal/manifest"
 	"github.com/mohamed/m314dl/internal/mp4"
@@ -68,10 +69,62 @@ func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream) (*ce
 
 	key := resolveKey(cfg.Keys, info.DefaultKID, manifestKID(st))
 	if key == nil {
+		// SAMPLE-AES (cbcs) may deliver a raw key through a fetchable URI, like
+		// AES-128, rather than being supplied with -key.
+		if uri := firstFetchableSampleAESURI(st); uri != "" {
+			kc := &keyCache{client: cfg.Client}
+			k, err := kc.get(ctx, uri)
+			if err != nil {
+				return nil, fmt.Errorf("fetch SAMPLE-AES key for %s: %w", st.ID, err)
+			}
+			key = k
+		}
+	}
+	if key == nil {
 		return nil, fmt.Errorf("no key for stream %s (KID %x); supply -key %x:<hex-key>",
 			st.ID, info.DefaultKID, info.DefaultKID)
 	}
 	return &cencDecryptor{info: info, key: key}, nil
+}
+
+// firstSampleAESKey returns the first SAMPLE-AES key in the stream, or nil.
+func firstSampleAESKey(st *manifest.Stream) *manifest.Key {
+	for i := range st.Segments {
+		if k := st.Segments[i].Key; k != nil && k.Method == manifest.EncSampleAES {
+			return k
+		}
+	}
+	return nil
+}
+
+// firstFetchableSampleAESURI returns the first SAMPLE-AES key URI that can be
+// fetched (http/https/data), or "".
+func firstFetchableSampleAESURI(st *manifest.Stream) string {
+	if k := firstSampleAESKey(st); k != nil && fetchableKeyURI(k.URI) {
+		return k.URI
+	}
+	return ""
+}
+
+// fetchableKeyURI reports whether a key URI points at bytes we can retrieve
+// (as opposed to skd:// or an empty URI, whose key must come from -key).
+func fetchableKeyURI(uri string) bool {
+	return strings.HasPrefix(uri, "http://") ||
+		strings.HasPrefix(uri, "https://") ||
+		strings.HasPrefix(uri, "data:")
+}
+
+// sampleAESKey resolves the content key for a transport-stream SAMPLE-AES
+// segment: a fetchable URI (like AES-128) if present, else the user-supplied
+// -key (matched by KID, or the single bare key).
+func sampleAESKey(ctx context.Context, kc *keyCache, keys map[[16]byte][]byte, k *manifest.Key) ([]byte, error) {
+	if fetchableKeyURI(k.URI) {
+		return kc.get(ctx, k.URI)
+	}
+	if key := resolveKey(keys, k.KID); key != nil {
+		return key, nil
+	}
+	return nil, fmt.Errorf("no key for SAMPLE-AES segment; supply the content key with -key <hex-key>")
 }
 
 // resolveKey looks up a content key by any known KID, falling back to the sole

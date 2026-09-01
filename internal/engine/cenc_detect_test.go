@@ -120,3 +120,59 @@ func TestKnownKeyDecryptsAnInitDetectedStream(t *testing.T) {
 		t.Fatalf("the supplied key was not used: %v", err)
 	}
 }
+
+// cbcsInit is a minimal init whose sample entry declares the cbcs scheme
+// (constant IV, 1:9 pattern) — the shape an fMP4 HLS SAMPLE-AES stream uses.
+func cbcsInit(kid [16]byte, constIV []byte) []byte {
+	tenc := box("tenc", append(append([]byte{
+		1, 0, 0, 0, // version 1 (pattern present), flags
+		0,          // reserved
+		(1 << 4) | 9, // crypt_byte_block=1, skip_byte_block=9
+		1,          // is_protected
+		0,          // per_sample_IV_size = 0 -> constant IV
+	}, kid[:]...), append([]byte{byte(len(constIV))}, constIV...)...))
+	schi := box("schi", tenc)
+	schm := box("schm", []byte{0, 0, 0, 0}, []byte("cbcs"), []byte{0, 1, 0, 0})
+	sinf := box("sinf", schm, schi)
+	visual := make([]byte, 78)
+	visual[7] = 1
+	encv := box("encv", visual, sinf)
+	stsd := box("stsd", []byte{0, 0, 0, 0, 0, 0, 0, 1}, encv)
+	return box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
+}
+
+// An fMP4 stream flagged SAMPLE-AES (== cbcs) with a supplied key is routed
+// through the CENC/cbcs decryptor, not refused.
+func TestSampleAESfMP4RoutesToCBCS(t *testing.T) {
+	kid := [16]byte{0x11, 0x22, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	constIV := bytes.Repeat([]byte{0x42}, 16)
+	initSeg := cbcsInit(kid, constIV)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "init.mp4") {
+			w.Write(initSeg)
+			return
+		}
+		w.Write(box("moof", box("mfhd", []byte{0, 0, 0, 0, 0, 0, 0, 1})))
+	}))
+	defer srv.Close()
+
+	st := &manifest.Stream{
+		ID:   "video",
+		Init: &manifest.InitMap{URL: srv.URL + "/init.mp4"},
+		Segments: []manifest.Segment{{
+			URL: srv.URL + "/seg0", Seq: 0, Duration: 1,
+			Key: &manifest.Key{Method: manifest.EncSampleAES, URI: "skd://x"},
+		}},
+	}
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	var zero [16]byte
+	err := DownloadStream(context.Background(),
+		Config{Client: client, Keys: map[[16]byte][]byte{zero: make([]byte, 16)}},
+		st, filepath.Join(t.TempDir(), "out.mp4"), nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "not supported") || strings.Contains(err.Error(), "no key") {
+			t.Fatalf("fMP4 SAMPLE-AES was not routed to the cbcs path: %v", err)
+		}
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

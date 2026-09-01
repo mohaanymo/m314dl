@@ -118,6 +118,27 @@ func TestByteRangeChain(t *testing.T) {
 }
 
 func TestDRMDetected(t *testing.T) {
+	// Widevine/PlayReady keyformats are CENC (fMP4); their key is looked up from
+	// the init's tenc, so the manifest URI is not treated as a fetchable key.
+	pl := `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;base64,AAAA",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+#EXTINF:6,
+s1.ts
+#EXT-X-ENDLIST
+`
+	st := &manifest.Stream{}
+	if err := ParseMedia([]byte(pl), "https://ex.com/a.m3u8", st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Segments[0].Key.Method != manifest.EncCENC {
+		t.Fatalf("want CENC, got %v", st.Segments[0].Key.Method)
+	}
+}
+
+// A FairPlay SAMPLE-AES stream stays SAMPLE-AES: its raw key is user-supplied
+// and it decrypts natively (cbcs for fMP4, or the TS SAMPLE-AES path for TS).
+func TestFairPlaySampleAES(t *testing.T) {
 	pl := `#EXTM3U
 #EXT-X-TARGETDURATION:6
 #EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://foo",KEYFORMAT="com.apple.streamingkeydelivery"
@@ -129,8 +150,8 @@ s1.ts
 	if err := ParseMedia([]byte(pl), "https://ex.com/a.m3u8", st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Segments[0].Key.Method != manifest.EncCENC {
-		t.Fatalf("want CENC, got %v", st.Segments[0].Key.Method)
+	if st.Segments[0].Key.Method != manifest.EncSampleAES {
+		t.Fatalf("want SAMPLE-AES, got %v", st.Segments[0].Key.Method)
 	}
 }
 

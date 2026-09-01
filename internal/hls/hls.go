@@ -252,12 +252,13 @@ func parseKey(attrs, baseURL string) (*manifest.Key, error) {
 	default:
 		k.Method = manifest.EncMethod(method)
 	}
-	// DRM keyformats are CENC regardless of METHOD
+	// Widevine/PlayReady keyformats mean CENC (fMP4) regardless of METHOD. A
+	// FairPlay SAMPLE-AES stream (com.apple.streamingkeydelivery / skd://) is
+	// left as SAMPLE-AES: its raw key is user-supplied and it decrypts natively —
+	// as cbcs for fMP4, or the transport-stream SAMPLE-AES path for TS.
 	switch kf := a["KEYFORMAT"]; {
 	case strings.Contains(kf, "urn:uuid:edef8ba9"), // widevine
-		strings.Contains(kf, "urn:uuid:9a04f079"), // playready
-		kf == "com.apple.streamingkeydelivery",
-		strings.HasPrefix(a["URI"], "skd://"):
+		strings.Contains(kf, "urn:uuid:9a04f079"): // playready
 		k.Method = manifest.EncCENC
 	}
 	if k.Method != manifest.EncCENC {
