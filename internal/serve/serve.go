@@ -137,13 +137,22 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 
 // buildPublisherJobs wires each stream to a track in a new Publisher (shared by
 // the HLS and DASH paths, which differ only in the handler).
+//
+// Every track is built live (rolling window), even for a finite source: a
+// restream is a live channel, so the output must signal live to players (no
+// premature end, DASH type=dynamic) and hold only a bounded window in memory.
+// A finite source presented as VOD instead snapshots mid-download — a static
+// MPD makes the player stop at whatever had downloaded when it fetched the
+// manifest — and accumulates the whole asset in RAM. Pacing (RunJobs sets
+// PaceRealtime for finite sources) is what keeps this window advancing at
+// realtime instead of racing through the asset at download speed.
 func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []Job) {
 	pub := restream.NewPublisher()
 	namer := newNamer()
 	var jobs []Job
 	for _, st := range streams {
 		id := namer(st)
-		sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live))
+		sink := pub.AddTrack(restream.TrackFromStream(id, st, true))
 		jobs = append(jobs, Job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+source.RawExt(st))})
 	}
 	return pub, jobs

@@ -1,7 +1,11 @@
 package restream
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mohamed/m314dl/internal/engine"
 )
@@ -86,20 +90,27 @@ func TestTSBroadcastFanout(t *testing.T) {
 	}
 }
 
-// A subscriber that never drains fills its buffer and is kicked, while the
-// producer never blocks and a subscriber that keeps draining keeps receiving —
-// the exact opposite of the drm worker's serial-stall (a stuck viewer there
-// froze everyone). Single-goroutine and deterministic: if publish ever blocked,
-// this test would deadlock instead of failing.
+// A subscriber that never drains exceeds its byte budget and is kicked (and
+// unsubscribed, so no further gapped units reach it), while the producer never
+// blocks and a subscriber that keeps draining keeps receiving — the exact
+// opposite of the drm worker's serial-stall (a stuck viewer there froze
+// everyone). Single-goroutine and deterministic: if publish ever blocked, this
+// test would deadlock instead of failing.
 func TestTSSlowSubscriberKicked(t *testing.T) {
+	old := maxSubQueuedBytes
+	maxSubQueuedBytes = 20
+	defer func() { maxSubQueuedBytes = old }()
+
 	b := NewTSBroadcaster()
-	slow := b.Subscribe() // never drained
+	slow := b.Subscribe() // never drained; 8-byte units bust the 20-byte budget on the 3rd
 	fast := b.Subscribe() // drained every iteration
 
-	for i := 0; i < tsSubBuffer+3; i++ {
-		b.publish([]byte{byte(i)})
+	for i := 0; i < 5; i++ {
+		seg := []byte{byte(i), 0, 0, 0, 0, 0, 0, 0}
+		b.publish(seg)
 		select {
 		case v := <-fast.data:
+			fast.queued.Add(-int64(len(v)))
 			if v[0] != byte(i) {
 				t.Fatalf("fast subscriber out of order: got %d want %d", v[0], i)
 			}
@@ -111,7 +122,75 @@ func TestTSSlowSubscriberKicked(t *testing.T) {
 	select {
 	case <-slow.kicked:
 	default:
-		t.Fatal("slow subscriber should have been kicked once its buffer filled")
+		t.Fatal("slow subscriber should have been kicked once its byte budget filled")
+	}
+	if len(slow.data) != 2 {
+		t.Fatalf("slow subscriber should hold only pre-kick units, has %d", len(slow.data))
+	}
+	if b.Viewers() != 1 {
+		t.Fatalf("kicked subscriber still registered: viewers=%d want 1", b.Viewers())
+	}
+}
+
+// A new subscriber is primed with the most recent published unit, so a joiner
+// has media immediately instead of waiting up to a whole segment interval.
+func TestTSSubscriberPrimedWithLast(t *testing.T) {
+	b := NewTSBroadcaster()
+	b.publish([]byte("SEG-1"))
+	b.publish([]byte("SEG-2"))
+	s := b.Subscribe()
+	select {
+	case v := <-s.data:
+		if string(v) != "SEG-2" {
+			t.Fatalf("primed with %q, want most recent unit", v)
+		}
+	default:
+		t.Fatal("new subscriber not primed with the last published unit")
+	}
+	if q := s.queued.Load(); q != int64(len("SEG-2")) {
+		t.Fatalf("primed unit not accounted: queued=%d", q)
+	}
+}
+
+// When the stream ends, a connected viewer receives everything already queued
+// (the finite tail) instead of being cut off mid-buffer; a viewer joining
+// after the end is refused instead of getting an instant empty 200.
+func TestTSServerDrainsOnEndAndRefusesLateJoin(t *testing.T) {
+	b := NewTSBroadcaster()
+	srv := httptest.NewServer(NewTSServer(b))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/live.ts")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for b.Viewers() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("handler never subscribed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	b.publish([]byte("SEG-A."))
+	b.publish([]byte("SEG-B."))
+	b.End()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "SEG-A.SEG-B." {
+		t.Fatalf("viewer lost queued tail at end: got %q", body)
+	}
+
+	late, err := http.Get(srv.URL + "/live.ts")
+	if err != nil {
+		t.Fatalf("late GET: %v", err)
+	}
+	late.Body.Close()
+	if late.StatusCode != http.StatusNotFound {
+		t.Fatalf("late join after end: status %d, want 404", late.StatusCode)
 	}
 }
 

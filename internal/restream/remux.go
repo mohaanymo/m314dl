@@ -106,17 +106,25 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 }
 
 // pump reads the remuxed TS off FFmpeg and fans it out until FFmpeg exits.
+// Only whole 188-byte packets are published (the unaligned tail of a read is
+// carried into the next one): a subscriber joins the broadcast at a publish
+// boundary, and starting it mid-packet would feed the player torn TS.
 func (rm *RemuxTS) pump(stdout io.ReadCloser) {
 	buf := make([]byte, remuxReadChunk)
+	fill := 0
 	for {
-		n, err := stdout.Read(buf)
+		n, err := stdout.Read(buf[fill:])
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			rm.b.publish(chunk)
+			fill += n
+			if aligned := fill - fill%tsPacketSize; aligned > 0 {
+				chunk := make([]byte, aligned)
+				copy(chunk, buf[:aligned])
+				rm.b.publish(chunk)
+				fill = copy(buf, buf[aligned:fill])
+			}
 		}
 		if err != nil {
-			break
+			break // a final sub-packet fragment is undecodable; drop it
 		}
 	}
 	// FFmpeg output ended: no more segments will be broadcast.

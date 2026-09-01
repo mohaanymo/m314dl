@@ -119,26 +119,62 @@ func writePlaylist(w http.ResponseWriter, body []byte) {
 func NewTSServer(b *TSBroadcaster) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live.ts", func(w http.ResponseWriter, r *http.Request) {
+		if b.Ended() {
+			// The broadcast is over and holds no rewind buffer: an empty 200
+			// that immediately closes just looks like a broken stream to a
+			// player, so refuse the join outright.
+			http.NotFound(w, r)
+			return
+		}
 		cors(w)
 		w.Header().Set("Content-Type", "video/mp2t")
 		w.Header().Set("Cache-Control", "no-cache, no-store")
 		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush() // send headers now; the first media may be seconds away
+		}
 
 		sub := b.Subscribe()
 		defer b.Unsubscribe(sub)
+		write := func(seg []byte) bool {
+			sub.queued.Add(-int64(len(seg)))
+			if _, err := w.Write(seg); err != nil {
+				return false // client went away
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return true
+		}
 		for {
+			// A kicked subscriber's queue has a gap after it (the unit that
+			// overflowed was never queued), so check kicked before draining
+			// more data — bytes past the gap would corrupt the viewer's TS.
+			select {
+			case <-sub.kicked:
+				return // fell too far behind
+			default:
+			}
 			select {
 			case seg := <-sub.data:
-				if _, err := w.Write(seg); err != nil {
-					return // client went away
-				}
-				if flusher != nil {
-					flusher.Flush()
+				if !write(seg) {
+					return
 				}
 			case <-sub.kicked:
 				return // fell too far behind
 			case <-b.done:
-				return // stream ended
+				// Stream ended: deliver what was already queued (the finite
+				// tail) instead of cutting the viewer off mid-buffer.
+				for {
+					select {
+					case seg := <-sub.data:
+						if !write(seg) {
+							return
+						}
+					default:
+						return
+					}
+				}
 			case <-r.Context().Done():
 				return // client disconnected
 			}

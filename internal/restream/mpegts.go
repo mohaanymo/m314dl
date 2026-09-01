@@ -20,31 +20,46 @@ import (
 // The broadcaster fixes the worker's worst flaw. There, a slow subscriber
 // stalled the producer — and therefore every other viewer — for up to two
 // seconds each, serially (audit #20). Here every send is non-blocking: a client
-// that falls a whole buffer behind is dropped, and no one else ever waits on it.
+// that falls a byte budget behind is dropped, and no one else ever waits on it.
 //
 // Publishing whole segments (not arbitrary byte chunks) is deliberate: each HLS
 // TS segment begins with PAT/PMT and is independently decodable, so a client
 // that joins mid-stream always starts on a clean, playable boundary.
 
-// tsSubBuffer is how many segments a subscriber may fall behind before it is
-// dropped. At ~4-6s segments that is ~30-45s of slack — generous for a network
-// hiccup, bounded so one stuck client can't grow memory without limit.
-const tsSubBuffer = 8
+// maxSubQueuedBytes is how many bytes a subscriber may have queued (published
+// but not yet written to its socket) before it is dropped. Slack must be
+// measured in bytes, not publish units: the remux pump publishes whatever each
+// pipe read returned (often a few KB), so a unit-counted buffer collapsed to a
+// fraction of a second of slack and kicked every viewer within seconds. 32 MiB
+// is ~30-60s at typical bitrates — generous for a network hiccup, bounded so
+// one stuck client can't grow memory without limit. A var so tests can shrink
+// it.
+var maxSubQueuedBytes = int64(32 << 20)
+
+// tsSubChanCap sizes each subscriber's channel. Large enough that the byte
+// budget, not the slot count, is what triggers a kick even for small chunks;
+// it only bounds slice headers (~24B each), not payload.
+const tsSubChanCap = 4096
 
 // TSBroadcaster fans one ordered segment stream out to many HTTP subscribers.
+// publish is called by exactly one producer goroutine (the TSSink writer or
+// the remux pump).
 type TSBroadcaster struct {
 	mu   sync.RWMutex
 	subs map[*tsSub]struct{}
+	last []byte // most recent published unit, primed into new subscribers
 	done chan struct{}
 
 	segments atomic.Int64
 	bytes    atomic.Int64
 }
 
-// tsSub is one connected client. data carries whole segments (shared, never
-// mutated after publish); kicked closes when the client falls too far behind.
+// tsSub is one connected client. data carries whole publish units (shared,
+// never mutated after publish); queued tracks the bytes in data not yet taken
+// by the handler; kicked closes when the client falls too far behind.
 type tsSub struct {
 	data   chan []byte
+	queued atomic.Int64
 	kicked chan struct{}
 }
 
@@ -52,10 +67,18 @@ func NewTSBroadcaster() *TSBroadcaster {
 	return &TSBroadcaster{subs: map[*tsSub]struct{}{}, done: make(chan struct{})}
 }
 
-// Subscribe registers a client. The caller must Unsubscribe when it disconnects.
+// Subscribe registers a client. The caller must Unsubscribe when it
+// disconnects. The new subscriber is primed with the most recent published
+// unit so a joiner has something to decode immediately instead of waiting up
+// to a whole segment interval for the first byte; holding b.mu across prime
+// and registration keeps the sequence gapless against a concurrent publish.
 func (b *TSBroadcaster) Subscribe() *tsSub {
-	s := &tsSub{data: make(chan []byte, tsSubBuffer), kicked: make(chan struct{})}
+	s := &tsSub{data: make(chan []byte, tsSubChanCap), kicked: make(chan struct{})}
 	b.mu.Lock()
+	if b.last != nil {
+		s.queued.Store(int64(len(b.last)))
+		s.data <- b.last
+	}
 	b.subs[s] = struct{}{}
 	b.mu.Unlock()
 	return s
@@ -68,42 +91,59 @@ func (b *TSBroadcaster) Unsubscribe(s *tsSub) {
 }
 
 // publish hands one segment to every subscriber without ever blocking. A
-// subscriber whose buffer is full has fallen too far behind: it is kicked (a
+// subscriber over its byte budget has fallen too far behind: it is kicked (a
 // clean disconnect) rather than dropped-from, because losing bytes mid-TS
 // corrupts the stream for that viewer. The producer never waits.
 func (b *TSBroadcaster) publish(seg []byte) {
 	b.segments.Add(1)
 	b.bytes.Add(int64(len(seg)))
-	b.mu.RLock()
-	subs := make([]*tsSub, 0, len(b.subs))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.last = seg
 	for s := range b.subs {
-		subs = append(subs, s)
-	}
-	b.mu.RUnlock()
-	for _, s := range subs {
+		if s.queued.Load()+int64(len(seg)) > maxSubQueuedBytes {
+			b.kickLocked(s) // too many bytes behind; drop this one, never block the rest
+			continue
+		}
 		select {
 		case s.data <- seg:
+			s.queued.Add(int64(len(seg)))
 		default:
-			b.kick(s) // buffer full → too slow; drop this one, never block the rest
+			b.kickLocked(s) // slot count exhausted (pathologically small chunks)
 		}
 	}
 }
 
-func (b *TSBroadcaster) kick(s *tsSub) {
+// kickLocked disconnects a lagging subscriber and removes it from the fan-out,
+// so no further (now gapped, hence corrupt) units are queued to it. Caller
+// holds b.mu.
+func (b *TSBroadcaster) kickLocked(s *tsSub) {
 	select {
 	case <-s.kicked:
 	default:
 		close(s.kicked)
 	}
+	delete(b.subs, s)
 }
 
 // End signals every subscriber that the stream has finished, so their handlers
-// close the HTTP response cleanly.
+// drain what is queued and close the HTTP response cleanly.
 func (b *TSBroadcaster) End() {
 	select {
 	case <-b.done:
 	default:
 		close(b.done)
+	}
+}
+
+// Ended reports whether the stream has finished (End was called). A finished
+// broadcast has nothing live left to join.
+func (b *TSBroadcaster) Ended() bool {
+	select {
+	case <-b.done:
+		return true
+	default:
+		return false
 	}
 }
 
