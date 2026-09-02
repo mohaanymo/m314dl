@@ -19,14 +19,19 @@ import (
 //
 // A dynamic (live) MPD advertises minimumUpdatePeriod so players re-fetch it;
 // a static (VOD) MPD lists the whole timeline and a mediaPresentationDuration.
-// DASH segments are fMP4 — a TS source must be remuxed first (a later phase),
-// which the coordinator enforces before choosing this output.
+// A VOD still downloading must be dynamic — a static MPD is fetched once, so a
+// player would snapshot the partial timeline and stop there — but with a
+// timeShiftBufferDepth spanning the whole (untrimmed) timeline, so everything
+// published so far stays seekable; it flips to static once the source
+// completes. DASH segments are fMP4 — a TS source must be remuxed first (a
+// later phase), which the coordinator enforces before choosing this output.
 
 const isoTime = "2006-01-02T15:04:05Z"
 
 // DASHManifest renders the presentation as an MPD.
 func (p *Publisher) DASHManifest() []byte {
 	live := p.isLive()
+	done := p.allEnded()
 	td := p.maxTargetDur()
 	now := time.Now().UTC()
 
@@ -35,16 +40,31 @@ func (p *Publisher) DASHManifest() []byte {
 
 	profile := "urn:mpeg:dash:profile:isoff-on-demand:2011"
 	typ := "static"
-	if live {
+	if live || !done {
 		profile = "urn:mpeg:dash:profile:isoff-live:2011"
 		typ = "dynamic"
 	}
 	fmt.Fprintf(&b, `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles=%q type=%q minBufferTime="PT%.1fS"`,
 		profile, typ, td)
-	if live {
+	switch {
+	case live:
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
 			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*float64(windowSize), td*3)
-	} else {
+	case !done:
+		// VOD mid-download: dynamic so players keep re-fetching, with DVR depth
+		// covering the entire timeline back to t=0 (nothing is ever trimmed) so
+		// everything published stays seekable. The spool can outgrow the wall
+		// clock, so a player that derives availability from now-AST may cap its
+		// range at wall-clock elapsed rather than the full spool — the phase is
+		// brief (the download is unpaced) and ends in a fully seekable static
+		// MPD, and every segment the timeline lists is truly fetchable.
+		total := p.totalDur()
+		if total < td {
+			total = td // no segments yet: never advertise a zero DVR window
+		}
+		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
+			p.start.UTC().Format(isoTime), now.Format(isoTime), td, total, td*3)
+	default:
 		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, p.totalDur())
 	}
 	b.WriteString(">\n")
@@ -78,6 +98,20 @@ func (p *Publisher) isLive() bool {
 		}
 	}
 	return false
+}
+
+// allEnded reports whether every track has finished (End was called), i.e. the
+// presentation is complete and a VOD MPD may go static.
+func (p *Publisher) allEnded() bool {
+	for _, t := range p.tracks {
+		t.mu.RLock()
+		e := t.ended
+		t.mu.RUnlock()
+		if !e {
+			return false
+		}
+	}
+	return len(p.tracks) > 0
 }
 
 func (p *Publisher) maxTargetDur() float64 {

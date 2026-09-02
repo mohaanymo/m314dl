@@ -16,6 +16,8 @@ package restream
 import (
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -37,14 +39,6 @@ const (
 	audioGroup = "aud"
 	subsGroup  = "subs"
 )
-
-// maxWindowBytes bounds a VOD track's in-memory segment window. A VOD keeps the
-// whole seekable playlist, but a long asset would otherwise grow the window
-// without limit and OOM the process; past this budget the oldest segments are
-// evicted and the playlist becomes a sliding DVR window. A var (not const) so
-// tests can shrink it. ponytail: fixed 256 MiB/track; make it a flag if
-// operators need deeper seek.
-var maxWindowBytes int64 = 256 << 20
 
 // Publisher holds every track of one live presentation and renders its
 // playlists. Tracks are added once at startup, then only their segment windows
@@ -157,14 +151,14 @@ type Track struct {
 	audioGroup string // video: the audio group it plays with (references audioGroup const)
 	subsGroup  string
 	fmp4       bool
-	live       bool   // live: roll a fixed window; VOD: keep every segment
+	live       bool   // live: roll a fixed in-memory window; VOD: spool every segment to disk
+	spoolDir   string // VOD only: where segment files live (the run's tmpDir)
 	segExt     string // "ts" | "m4s"
 
 	mu          sync.RWMutex
 	init        []byte
 	initAt      time.Time
 	segs        []*segment
-	winBytes    int64 // total bytes held in segs, for the VOD memory cap
 	targetDur   float64
 	seq         int64 // output media sequence of the next segment (monotonic; never reset)
 	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
@@ -178,15 +172,17 @@ type segment struct {
 	dur     float64
 	startMS int64 // presentation start time in ms (DASH SegmentTimeline @t)
 	disc    bool
-	data    []byte
+	size    int64
+	data    []byte // live window only; a VOD segment's bytes live on disk
 	at      time.Time
 }
 
 // TrackFromStream builds a Track from a selected stream. id is a short,
 // URL-safe identifier assigned by the caller (e.g. "video", "audio-fr"). live
-// selects the output shape: a rolling window (live) or a full growing playlist
-// that ends in EXT-X-ENDLIST (VOD).
-func TrackFromStream(id string, st *manifest.Stream, live bool) *Track {
+// selects the output shape: a rolling in-memory window (live) or a seekable
+// growing playlist whose segments are spooled to files under spoolDir so the
+// whole asset never sits in RAM (VOD; spoolDir is unused for live).
+func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string) *Track {
 	fmp4 := st.Init != nil || segmentIsFMP4(st)
 	ext := "ts"
 	if fmp4 {
@@ -197,8 +193,14 @@ func TrackFromStream(id string, st *manifest.Stream, live bool) *Track {
 		bandwidth: st.Bandwidth, width: st.Width, height: st.Height,
 		frameRate: st.FrameRate, codecs: st.Codecs,
 		language: st.Language, name: st.Name, channels: st.Channels, def: st.Default,
-		fmp4: fmp4, live: live, segExt: ext,
+		fmp4: fmp4, live: live, spoolDir: spoolDir, segExt: ext,
 	}
+}
+
+// spoolPath is where a VOD segment's bytes live on disk. Filenames are
+// prefixed with the track id so every track can share the run's tmpDir.
+func (t *Track) spoolPath(name string) string {
+	return filepath.Join(t.spoolDir, t.ID+"-"+name)
 }
 
 func segmentIsFMP4(st *manifest.Stream) bool {
@@ -219,10 +221,23 @@ func (t *Track) Init(data []byte) error {
 	return nil
 }
 
-// Segment implements engine.Sink: appends one segment to the rolling window and
-// trims anything aged out. Renumbers under the track's own monotonic sequence
-// so a source that rewinds its media sequence cannot wedge or rewind output.
+// Segment implements engine.Sink: appends one segment (rolling in-memory
+// window for live, spool file for VOD) and trims anything aged out. Renumbers
+// under the track's own monotonic sequence so a source that rewinds its media
+// sequence cannot wedge or rewind output.
 func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
+	// Only the engine's ordered writer calls Segment, so t.seq is stable here
+	// without the lock (readers take RLock; only this goroutine writes it).
+	// Spooling before taking the lock keeps a multi-MB disk write from
+	// blocking playlist renders, and means a segment is only ever listed once
+	// its file is complete — the HTTP handler can never see a partial write.
+	name := fmt.Sprintf("%06d.%s", t.seq, t.segExt)
+	if !t.live {
+		if err := os.WriteFile(t.spoolPath(name), data, 0o644); err != nil {
+			return fmt.Errorf("spool segment %s: %w", name, err)
+		}
+	}
+
 	dur := info.Duration
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -238,38 +253,35 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 		t.targetDur = dur
 	}
 
-	seq := t.seq
 	seg := &segment{
-		name: fmt.Sprintf("%06d.%s", seq, t.segExt),
-		seq:  seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity,
-		data: append([]byte(nil), data...), at: time.Now(),
+		name: name,
+		seq:  t.seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity,
+		size: int64(len(data)), at: time.Now(),
+	}
+	if t.live {
+		seg.data = append([]byte(nil), data...)
 	}
 	t.segs = append(t.segs, seg)
-	t.winBytes += int64(len(seg.data))
 	t.seq++
 	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
 
 	// Live: trim beyond window+tail; the tail keeps just-evicted segments
 	// fetchable a moment longer for clients mid-download of the oldest visible
-	// one. VOD: keep the whole seekable playlist, but never past maxWindowBytes —
-	// a long asset then slides its window instead of exhausting memory. Evicted
-	// slots are nilled so their segment data can be garbage-collected (a bare
-	// reslice would pin it in the backing array).
+	// one. VOD keeps every segment — the bytes are on disk, so RAM stays flat
+	// however long the asset is. Evicted slots are nilled so their segment
+	// data can be garbage-collected (a bare reslice would pin it in the
+	// backing array).
 	if max := windowSize + tailExtra; t.live && len(t.segs) > max {
 		t.evictOldestLocked(len(t.segs) - max)
-	}
-	for !t.live && len(t.segs) > windowSize && t.winBytes > maxWindowBytes {
-		t.evictOldestLocked(1)
 	}
 	return nil
 }
 
-// evictOldestLocked drops the n oldest segments from the window, updating the
-// byte total and releasing them for GC. Caller holds t.mu.
+// evictOldestLocked drops the n oldest segments from the live window,
+// releasing them for GC. Caller holds t.mu.
 func (t *Track) evictOldestLocked(n int) {
 	for i := 0; i < n; i++ {
-		t.winBytes -= int64(len(t.segs[i].data))
 		t.segs[i] = nil
 	}
 	t.segs = t.segs[n:]
@@ -284,16 +296,21 @@ func (t *Track) visibleLocked() []*segment {
 	return t.segs[len(t.segs)-windowSize:]
 }
 
-// segmentByName returns a segment's bytes and modtime for the HTTP layer.
-func (t *Track) segmentByName(name string) ([]byte, time.Time, bool) {
+// segmentByName returns a segment for the HTTP layer: in-memory bytes for a
+// live window segment, a spool-file path for a VOD one. Only names present in
+// the segment table resolve, so the path can never leave the spool.
+func (t *Track) segmentByName(name string) (data []byte, path string, modtime time.Time, ok bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, s := range t.segs {
 		if s.name == name {
-			return s.data, s.at, true
+			if t.live {
+				return s.data, "", s.at, true
+			}
+			return nil, t.spoolPath(name), s.at, true
 		}
 	}
-	return nil, time.Time{}, false
+	return nil, "", time.Time{}, false
 }
 
 // initSegment returns the fMP4 init bytes and modtime.
@@ -315,7 +332,7 @@ func (t *Track) bitrateLocked() int64 {
 	var peak int64
 	for _, s := range t.segs {
 		if s.dur > 0 {
-			if br := int64(float64(len(s.data)) * 8 / s.dur); br > peak {
+			if br := int64(float64(s.size) * 8 / s.dur); br > peak {
 				peak = br
 			}
 		}
@@ -342,6 +359,12 @@ func (t *Track) mediaPlaylist() []byte {
 		td = 1
 	}
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", td)
+	// VOD: an EVENT playlist is append-only from sequence 0, so players may
+	// seek anywhere in what has been published while it keeps growing; it
+	// becomes a complete seekable asset once ENDLIST lands below.
+	if !t.live {
+		b.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
+	}
 	seq := int64(0)
 	if len(visible) > 0 {
 		seq = visible[0].seq

@@ -92,7 +92,7 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("seg")
-	data, modtime, ok := t.segmentByName(name)
+	data, path, modtime, ok := t.segmentByName(name)
 	if !ok {
 		// Aged out of the window, or never existed. 404 is correct: a live
 		// client should already have advanced to a newer segment.
@@ -101,6 +101,12 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 	}
 	cors(w)
 	w.Header().Set("Content-Type", segmentMIME(name))
+	if path != "" {
+		// VOD: bytes live in a spool file, fully written before it was listed.
+		// ServeFile keeps Range/conditional handling and streams from disk.
+		http.ServeFile(w, r, path)
+		return
+	}
 	http.ServeContent(w, r, name, modtime, bytes.NewReader(data))
 }
 

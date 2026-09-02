@@ -378,7 +378,6 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 
 	err := serve.RunJobs(ctx, client, kind, jobs, keys, nil, 0, w.logv)
 	ch.pres.End()
-	os.RemoveAll(ch.tmpDir)
 
 	ch.mu.Lock()
 	switch {
@@ -390,6 +389,13 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 		ch.state = "done" // finite source finished; still served (ENDLIST)
 	}
 	ch.mu.Unlock()
+
+	// A finished VOD channel keeps serving its spooled segments from tmpDir, so
+	// the spool must outlive the download and go only when the channel does
+	// (stop/removal cancels ctx). A stale spool from a crash is swept by
+	// useSpool at the next startup.
+	<-ctx.Done()
+	os.RemoveAll(ch.tmpDir)
 }
 
 func (w *workerServer) stopAll() {

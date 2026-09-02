@@ -9,21 +9,52 @@ import (
 	"github.com/mohamed/m314dl/internal/manifest"
 )
 
-func dashPub(live bool) (*Publisher, engine.Sink, engine.Sink) {
+func dashPub(t *testing.T, live bool) (*Publisher, engine.Sink, engine.Sink) {
+	t.Helper()
 	pub := NewPublisher()
 	v := &manifest.Stream{Type: manifest.Video, ID: "v", Width: 1920, Height: 1080,
 		FrameRate: 25, Codecs: "avc1.640028", Bandwidth: 5_000_000, Init: &manifest.InitMap{URL: "i"}, Live: live}
 	a := &manifest.Stream{Type: manifest.Audio, ID: "a", Language: "en", Codecs: "mp4a.40.2",
 		Channels: "2", Bandwidth: 128_000, Init: &manifest.InitMap{URL: "i"}, Live: live}
-	vs := pub.AddTrack(TrackFromStream("video", v, live))
-	as := pub.AddTrack(TrackFromStream("audio-en", a, live))
+	spool := ""
+	if !live {
+		spool = t.TempDir()
+	}
+	vs := pub.AddTrack(TrackFromStream("video", v, live, spool))
+	as := pub.AddTrack(TrackFromStream("audio-en", a, live, spool))
 	vs.Init([]byte("vi"))
 	as.Init([]byte("ai"))
 	return pub, vs, as
 }
 
+// A VOD still downloading must stay dynamic (a static MPD would be fetched
+// once, snapshotting the partial timeline) with DVR depth spanning the whole
+// untrimmed timeline so everything published is seekable.
+func TestDASHManifestVODGrowing(t *testing.T) {
+	pub, vs, as := dashPub(t, false)
+	feed(vs, 4, 4.0)
+	feed(as, 4, 4.0)
+	// no End: the source is still downloading
+
+	m := string(pub.DASHManifest())
+	for _, want := range []string{
+		`type="dynamic"`,
+		"minimumUpdatePeriod=",
+		`timeShiftBufferDepth="PT16S"`, // spans the whole 16s timeline
+		`startNumber="0"`,
+		`<S t="0" d="4000" r="3"/>`, // full timeline from t=0, untrimmed
+	} {
+		if !strings.Contains(m, want) {
+			t.Fatalf("growing VOD MPD missing %q\n%s", want, m)
+		}
+	}
+	if strings.Contains(m, "mediaPresentationDuration") {
+		t.Fatalf("growing VOD MPD must not be a fixed-duration snapshot\n%s", m)
+	}
+}
+
 func TestDASHManifestVOD(t *testing.T) {
-	pub, vs, as := dashPub(false)
+	pub, vs, as := dashPub(t, false)
 	feed(vs, 4, 4.0)
 	feed(as, 4, 4.0)
 	pub.End()
@@ -57,7 +88,7 @@ func TestDASHManifestVOD(t *testing.T) {
 }
 
 func TestDASHManifestLive(t *testing.T) {
-	pub, vs, as := dashPub(true)
+	pub, vs, as := dashPub(t, true)
 	feed(vs, windowSize+3, 4.0) // force a rolling window
 	feed(as, windowSize+3, 4.0)
 
@@ -90,7 +121,7 @@ func TestDASHManifestLive(t *testing.T) {
 
 func TestDASHTimelineRunLengthSplits(t *testing.T) {
 	pub := NewPublisher()
-	vs := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, false))
+	vs := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, false, t.TempDir()))
 	vs.Init([]byte("i"))
 	vs.Segment(engine.SegmentInfo{Duration: 4}, []byte("a"))
 	vs.Segment(engine.SegmentInfo{Duration: 4}, []byte("b"))
@@ -107,7 +138,7 @@ func TestDASHTimelineRunLengthSplits(t *testing.T) {
 }
 
 func TestDASHServeEndpoints(t *testing.T) {
-	pub, vs, as := dashPub(true)
+	pub, vs, as := dashPub(t, true)
 	feed(vs, 3, 4.0)
 	feed(as, 3, 4.0)
 

@@ -45,11 +45,15 @@ type Presentation interface {
 	StatusLine() string
 }
 
-// job is one source stream wired to the sink that publishes it.
+// job is one source stream wired to the sink that publishes it. pace holds a
+// finite source's emission to real time — needed only where the output has a
+// live edge to overrun (the TS broadcast); the seekable-VOD publisher spools
+// to disk and lets players pull at their own rate.
 type Job struct {
 	st   *manifest.Stream
 	sink engine.Sink
 	tmp  string
+	pace bool
 }
 
 // runRestream builds the output for the selected streams and hands off to the
@@ -98,7 +102,7 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 		if pure := singleMuxedTS(streams); pure != nil && o.Transcode == "" {
 			// Source is already a muxed TS: copy segments straight out, no ffmpeg.
 			b := restream.NewTSBroadcaster()
-			jobs := []Job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+source.RawExt(pure))}}
+			jobs := []Job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+source.RawExt(pure)), pace: !pure.Live}}
 			return b, restream.NewTSServer(b), "/live.ts", jobs, nil
 		}
 		// fMP4 source, separate audio, or a transcode was asked for: remux with
@@ -118,7 +122,7 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 		}
 		var jobs []Job
 		for i, st := range streams {
-			jobs = append(jobs, Job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+source.RawExt(st))})
+			jobs = append(jobs, Job{st: st, sink: rem.Sink(i), tmp: filepath.Join(tmpDir, fmt.Sprintf("in%d", i)+source.RawExt(st)), pace: !st.Live})
 		}
 		return rem, restream.NewTSServer(b), "/live.ts", jobs, nil
 	case "dash", "mpd":
@@ -138,21 +142,20 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 // buildPublisherJobs wires each stream to a track in a new Publisher (shared by
 // the HLS and DASH paths, which differ only in the handler).
 //
-// Every track is built live (rolling window), even for a finite source: a
-// restream is a live channel, so the output must signal live to players (no
-// premature end, DASH type=dynamic) and hold only a bounded window in memory.
-// A finite source presented as VOD instead snapshots mid-download — a static
-// MPD makes the player stop at whatever had downloaded when it fetched the
-// manifest — and accumulates the whole asset in RAM. Pacing (RunJobs sets
-// PaceRealtime for finite sources) is what keeps this window advancing at
-// realtime instead of racing through the asset at download speed.
+// The track shape follows the source. A live source rolls a bounded in-memory
+// window — a real live stream has no full timeline to seek. A finite source is
+// served as a seekable VOD: every segment is spooled decrypted to a file under
+// tmpDir and served from disk, so the whole timeline is seekable while RAM
+// holds only per-segment metadata. Neither shape is paced — live arrives at
+// its own cadence, and the VOD spool has no live edge to overrun, so players
+// pull from the growing on-disk playlist at their own rate.
 func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []Job) {
 	pub := restream.NewPublisher()
 	namer := newNamer()
 	var jobs []Job
 	for _, st := range streams {
 		id := namer(st)
-		sink := pub.AddTrack(restream.TrackFromStream(id, st, true))
+		sink := pub.AddTrack(restream.TrackFromStream(id, st, st.Live, tmpDir))
 		jobs = append(jobs, Job{st: st, sink: sink, tmp: filepath.Join(tmpDir, id+source.RawExt(st))})
 	}
 	return pub, jobs
@@ -236,9 +239,10 @@ func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 			cfg := engine.Config{
 				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
 				Verbose: logv, Sink: j.sink,
-				// A finite source downloads flat-out; pace it to real time so it
-				// doesn't flood the live output (TS viewer buffers, packager window).
-				PaceRealtime: !j.st.Live,
+				// A finite TS-broadcast source downloads flat-out; pace it to real
+				// time so it doesn't flood the viewers' buffers. The publisher
+				// paths spool to disk instead and are never paced.
+				PaceRealtime: j.pace,
 			}
 			refresh := source.RefreshFunc(client, kind, j.st, logv)
 			if !j.st.Live {

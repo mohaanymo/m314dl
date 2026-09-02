@@ -3,6 +3,8 @@ package restream
 import (
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -19,7 +21,7 @@ func feed(sink engine.Sink, n int, dur float64) {
 func TestMediaPlaylistFMP4(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "init.mp4"}}
-	sink := pub.AddTrack(TrackFromStream("video", st, true))
+	sink := pub.AddTrack(TrackFromStream("video", st, true, ""))
 	sink.Init([]byte("INIT"))
 	feed(sink, 3, 6.0)
 
@@ -45,7 +47,7 @@ func TestMediaPlaylistTS(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v",
 		Segments: []manifest.Segment{{URL: "http://x/0.ts"}}}
-	sink := pub.AddTrack(TrackFromStream("video", st, true))
+	sink := pub.AddTrack(TrackFromStream("video", st, true, ""))
 	feed(sink, 2, 4.0)
 
 	pl := string(pub.tracks[0].mediaPlaylist())
@@ -65,7 +67,7 @@ func TestMediaPlaylistTS(t *testing.T) {
 func TestWindowAndSequence(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}
-	sink := pub.AddTrack(TrackFromStream("video", st, true))
+	sink := pub.AddTrack(TrackFromStream("video", st, true, ""))
 	sink.Init([]byte("INIT"))
 	feed(sink, windowSize+10, 2.0)
 
@@ -90,7 +92,7 @@ func TestWindowAndSequence(t *testing.T) {
 // the packager renumbers under its own monotonic counter (worker bug #18).
 func TestSourceSequenceRewindIgnored(t *testing.T) {
 	pub := NewPublisher()
-	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true))
+	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
 	sink.Init([]byte("i"))
 	sink.Segment(engine.SegmentInfo{Duration: 2, Seq: 5000}, []byte("a"))
 	sink.Segment(engine.SegmentInfo{Duration: 2, Seq: 3}, []byte("b")) // source rewound
@@ -102,7 +104,7 @@ func TestSourceSequenceRewindIgnored(t *testing.T) {
 
 func TestDiscontinuityPassthrough(t *testing.T) {
 	pub := NewPublisher()
-	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true))
+	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
 	sink.Init([]byte("i"))
 	sink.Segment(engine.SegmentInfo{Duration: 2}, []byte("a"))
 	sink.Segment(engine.SegmentInfo{Duration: 2, Discontinuity: true}, []byte("b"))
@@ -116,7 +118,7 @@ func TestDiscontinuityPassthrough(t *testing.T) {
 
 func TestZeroDurationFallback(t *testing.T) {
 	pub := NewPublisher()
-	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true))
+	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
 	sink.Init([]byte("i"))
 	sink.Segment(engine.SegmentInfo{Duration: 0}, []byte("a")) // unknown → 2s default
 	pl := string(pub.tracks[0].mediaPlaylist())
@@ -131,8 +133,8 @@ func TestMasterPlaylist(t *testing.T) {
 		FrameRate: 25, Codecs: "avc1.640028", Bandwidth: 5_000_000, Init: &manifest.InitMap{URL: "i"}}
 	a := &manifest.Stream{Type: manifest.Audio, ID: "a", Language: "en", Codecs: "mp4a.40.2",
 		Channels: "2", Bandwidth: 128_000, Init: &manifest.InitMap{URL: "i"}}
-	vs := pub.AddTrack(TrackFromStream("video", v, true))
-	as := pub.AddTrack(TrackFromStream("audio-en", a, true))
+	vs := pub.AddTrack(TrackFromStream("video", v, true, ""))
+	as := pub.AddTrack(TrackFromStream("audio-en", a, true, ""))
 	vs.Init([]byte("i"))
 	as.Init([]byte("i"))
 	feed(vs, 2, 6)
@@ -168,8 +170,8 @@ func TestMasterPlaylist(t *testing.T) {
 // segments concurrently. Run under -race to prove the locking holds.
 func TestConcurrentServeAndWrite(t *testing.T) {
 	pub := NewPublisher()
-	vs := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true))
-	as := pub.AddTrack(TrackFromStream("audio", &manifest.Stream{Type: manifest.Audio, Init: &manifest.InitMap{URL: "i"}}, true))
+	vs := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
+	as := pub.AddTrack(TrackFromStream("audio", &manifest.Stream{Type: manifest.Audio, Init: &manifest.InitMap{URL: "i"}}, true, ""))
 	vs.Init([]byte("vi"))
 	as.Init([]byte("ai"))
 	h := NewServer(pub).Handler()
@@ -194,17 +196,26 @@ func TestConcurrentServeAndWrite(t *testing.T) {
 	}
 }
 
-// A finite (VOD) source keeps every segment (no rolling window) and, once
-// ended, publishes a complete seekable playlist with EXT-X-ENDLIST.
+// A finite (VOD) source keeps every segment (no rolling window) in an
+// append-only EVENT playlist that is seekable while it grows and, once ended,
+// gains EXT-X-ENDLIST.
 func TestVODKeepsAllSegments(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}
-	sink := pub.AddTrack(TrackFromStream("video", st, false)) // VOD
+	sink := pub.AddTrack(TrackFromStream("video", st, false, t.TempDir())) // VOD
 	sink.Init([]byte("i"))
 	feed(sink, windowSize+10, 3.0)
-	pub.End()
 
 	pl := string(pub.tracks[0].mediaPlaylist())
+	if !strings.Contains(pl, "#EXT-X-PLAYLIST-TYPE:EVENT") {
+		t.Fatalf("growing VOD playlist must be EVENT (append-only, seekable)\n%s", pl)
+	}
+	if strings.Contains(pl, "#EXT-X-ENDLIST") {
+		t.Fatalf("still-growing VOD playlist must not have ENDLIST\n%s", pl)
+	}
+	pub.End()
+
+	pl = string(pub.tracks[0].mediaPlaylist())
 	segs := strings.Count(pl, ".m4s\n")
 	if segs != windowSize+10 {
 		t.Fatalf("VOD should list all %d segments, listed %d\n%s", windowSize+10, segs, pl)
@@ -220,7 +231,7 @@ func TestVODKeepsAllSegments(t *testing.T) {
 func TestServeEndpoints(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}
-	sink := pub.AddTrack(TrackFromStream("video", st, true))
+	sink := pub.AddTrack(TrackFromStream("video", st, true, ""))
 	sink.Init([]byte("INITDATA"))
 	feed(sink, windowSize+tailExtra+5, 4.0) // force eviction
 
@@ -256,37 +267,43 @@ func TestServeEndpoints(t *testing.T) {
 	}
 }
 
-// A VOD track keeps the full playlist only until maxWindowBytes; past it the
-// oldest segments are evicted (sliding DVR window) so a long asset can't OOM.
-func TestTrackVODWindowByteCap(t *testing.T) {
-	old := maxWindowBytes
-	maxWindowBytes = 1000
-	defer func() { maxWindowBytes = old }()
-
+// A VOD track spools segment bytes to disk and holds only metadata in RAM, so
+// a long asset can't OOM; the HTTP handler serves the bytes back from the
+// spool file.
+func TestVODSpoolsToDisk(t *testing.T) {
+	dir := t.TempDir()
+	pub := NewPublisher()
 	st := &manifest.Stream{ID: "v", Type: manifest.Video, Segments: []manifest.Segment{{URL: "x.ts"}}}
-	tr := TrackFromStream("video", st, false) // false = VOD (keep-all, until the cap)
+	sink := pub.AddTrack(TrackFromStream("video", st, false, dir))
 	for i := 0; i < 30; i++ {
-		if err := tr.Segment(engine.SegmentInfo{Duration: 2}, make([]byte, 200)); err != nil {
+		if err := sink.Segment(engine.SegmentInfo{Duration: 2, Seq: int64(i)}, []byte(fmt.Sprintf("seg-%d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
 
-	if len(tr.segs) >= 30 {
-		t.Fatalf("VOD window never trimmed: %d segments held", len(tr.segs))
+	tr := pub.tracks[0]
+	tr.mu.RLock()
+	if len(tr.segs) != 30 {
+		t.Fatalf("VOD must keep every segment, held %d of 30", len(tr.segs))
 	}
-	if len(tr.segs) > windowSize && tr.winBytes > maxWindowBytes {
-		t.Fatalf("window over budget: %d bytes in %d segments, cap %d", tr.winBytes, len(tr.segs), maxWindowBytes)
-	}
-	if tr.segs[0].seq == 0 {
-		t.Fatal("oldest segment not evicted: first seq still 0")
-	}
-	var sum int64
 	for _, s := range tr.segs {
-		sum += int64(len(s.data))
+		if s.data != nil {
+			t.Fatalf("VOD segment %s held in RAM; must be spooled only", s.name)
+		}
 	}
-	if sum != tr.winBytes {
-		t.Fatalf("winBytes bookkeeping off: tracked %d, actual %d", tr.winBytes, sum)
+	tr.mu.RUnlock()
+
+	if _, err := os.Stat(filepath.Join(dir, "video-000007.ts")); err != nil {
+		t.Fatalf("spool file missing: %v", err)
+	}
+
+	h := NewServer(pub).Handler()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/video/000007.ts", nil))
+	if rec.Code != 200 || rec.Body.String() != "seg-7" {
+		t.Fatalf("spooled segment not served from disk: code=%d body=%q", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Content-Type") != "video/mp2t" {
+		t.Fatalf("spooled segment content-type = %q", rec.Header().Get("Content-Type"))
 	}
 }
