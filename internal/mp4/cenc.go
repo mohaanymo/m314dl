@@ -193,11 +193,19 @@ func decryptTrafs(frag []byte, moof box, moofOff, mdatOff int64, mdatData []byte
 	return ferr
 }
 
+// trunRun is one trun's contribution to a traf: its sample sizes and where its
+// (contiguous) sample data begins. A traf may carry several truns; their sample
+// data may sit in different, non-adjacent regions of the mdat, while senc/saiz
+// describe every sample of the traf as one global in-order list.
+type trunRun struct {
+	sizes   []uint32
+	dataOff int64
+	hasOff  bool // data_offset flag (0x000001) present
+}
+
 func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []byte, info *InitInfo, block cipher.Block) error {
 	var (
-		trunSizes           []uint32
-		trunDataOff         int64
-		haveTrun            bool
+		truns               []trunRun
 		sencIVs             [][]byte
 		sencSubs            [][]subsample
 		haveSenc            bool
@@ -214,7 +222,12 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		case "tfhd":
 			baseIsMoof, tfhdBaseDataOff, haveTfhdBaseDataOff = parseTfhd(b)
 		case "trun":
-			trunSizes, trunDataOff, haveTrun = parseTrun(b)
+			// Collect every trun in order (not just the last): senc/saiz index
+			// samples globally across all of them.
+			if sizes, off, ok := parseTrun(b); ok {
+				hasOff := len(b.payload) >= 4 && b.payload[3]&0x01 != 0
+				truns = append(truns, trunRun{sizes: sizes, dataOff: off, hasOff: hasOff})
+			}
 		case "senc":
 			sencIVs, sencSubs, haveSenc = parseSencAuto(b.payload, info.PerSampleIVLen)
 		case "uuid":
@@ -230,7 +243,7 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		}
 		return true
 	})
-	if !haveTrun {
+	if len(truns) == 0 {
 		return nil // no samples described; nothing to do
 	}
 
@@ -244,10 +257,12 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	default:
 		base = moofOff // default-base-is-moof is the fragmented norm
 	}
-	sampleStart := base + trunDataOff
-	dataStart := sampleStart - (mdatOff + mdatHeaderLen(frag, mdatOff))
-	if dataStart < 0 || dataStart > int64(len(mdatData)) {
-		return fmt.Errorf("mp4: sample data offset %d outside mdat (len %d)", dataStart, len(mdatData))
+	mdatBase := mdatOff + mdatHeaderLen(frag, mdatOff)
+
+	// senc/saiz describe the traf's samples as one global list, in trun order.
+	total := 0
+	for _, t := range truns {
+		total += len(t.sizes)
 	}
 
 	// Recover per-sample IVs + subsamples: prefer senc, else saiz/saio.
@@ -255,28 +270,41 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	subs := sencSubs
 	if !haveSenc {
 		var err error
-		ivs, subs, err = readAuxInfo(frag, moofOff, saioOffsets, saizDefault, saizSizes, haveSaiz, len(trunSizes), info)
+		ivs, subs, err = readAuxInfo(frag, moofOff, saioOffsets, saizDefault, saizSizes, haveSaiz, total, info)
 		if err != nil {
 			return err
 		}
 	}
 
-	pos := dataStart
-	for i, sz := range trunSizes {
-		end := pos + int64(sz)
-		if end > int64(len(mdatData)) {
-			return fmt.Errorf("mp4: sample %d overruns mdat", i)
+	// Walk samples globally: trun order, then sample order. Each trun's data
+	// begins at base + its data_offset (its samples are contiguous from there); a
+	// trun that omits data_offset continues where the previous one ended.
+	i := 0
+	var pos int64
+	for k, t := range truns {
+		if k == 0 || t.hasOff {
+			pos = base + t.dataOff - mdatBase
 		}
-		sample := mdatData[pos:end]
-		iv := sampleIV(ivs, i, info)
-		var ss []subsample
-		if i < len(subs) {
-			ss = subs[i]
+		if pos < 0 || pos > int64(len(mdatData)) {
+			return fmt.Errorf("mp4: sample data offset %d outside mdat (len %d)", pos, len(mdatData))
 		}
-		if err := decryptSample(sample, iv, ss, info, block); err != nil {
-			return fmt.Errorf("mp4: sample %d: %w", i, err)
+		for _, sz := range t.sizes {
+			end := pos + int64(sz)
+			if end > int64(len(mdatData)) {
+				return fmt.Errorf("mp4: sample %d overruns mdat", i)
+			}
+			sample := mdatData[pos:end]
+			iv := sampleIV(ivs, i, info)
+			var ss []subsample
+			if i < len(subs) {
+				ss = subs[i]
+			}
+			if err := decryptSample(sample, iv, ss, info, block); err != nil {
+				return fmt.Errorf("mp4: sample %d: %w", i, err)
+			}
+			pos = end
+			i++
 		}
-		pos = end
 	}
 	return nil
 }
