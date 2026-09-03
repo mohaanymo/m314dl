@@ -97,7 +97,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **HLS** (TS + fMP4): master/media playlists, rendition groups (`AUDIO=`/`SUBTITLES=` honored — best audio belongs to the picked variant), byte ranges, `EXT-X-MAP` changes mid-stream, AES-128 (in-process, `data:` key URIs supported), audio-only variant detection
 - **DASH**: SegmentTemplate (`$Number$`/`$Time$` + `%0Nd`), SegmentTimeline (negative `@r`), SegmentList, SegmentBase, multi-period (merged with discontinuity markers), namespace-agnostic lenient XML, `cenc:default_KID`
 - **Smooth Streaming (MSS)**: `.ism/Manifest` (VOD and live), `{bitrate}`/`{start time}` URL templates, `<c t d r>` timelines, H.264 + AAC (init segments are synthesized from `CodecPrivateData` — the presentation ships none), PIFF fragments normalized for players, PlayReady KID read from the `ProtectionHeader` and decrypted with `-key`
-- **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools
+- **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools. HLS **SAMPLE-AES** (AAC + H.264) is decrypted too, with a supplied key
 - **Live recording** for both protocols: starts at the live edge (`-live-from-start` for the whole DVR window), refresh failures retried forever, segment dedupe across refreshes, `-live-duration` limit, **Ctrl-C finishes the recording gracefully and muxes** — you never lose what you already recorded
 - **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx (honoring `Retry-After`) — no thread count to guess, and no hammering rate-limited CDNs; `-t N` pins exactly N (held, still backs off on rate limits)
 - **One TCP connection per in-flight request (HTTP/1.1)**: a CDN offering HTTP/2 would make Go multiplex every concurrent segment onto a single TCP connection, and one flow can't fill a real network's pipe (RTT- and loss-bound) — so downloads run over many independent HTTP/1.1 connections, the way `N_m3u8DL-RE`/`aria2`/`yt-dlp` do, for full aggregate throughput
@@ -107,6 +107,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **Subtitles**: WebVTT (concatenated segments deduped), TTML→SRT (lenient regex parsing — survives non-compliant XML), stpp-in-fMP4 extracted natively (no ffmpeg TTML gap), muxed with correct ISO 639-2 language tags — or written as sidecar files with `-sub-external`
 - **Flexible input**: an HTTP(S) URL (first *or* last argument), a local `.m3u8`/`.mpd` file or `file://` path (for manifests signed per request and never published), or a web page to scrape
 - **Page scraping**: point it at a web page; it finds `.m3u8`/`.mpd` URLs (inline JSON and one iframe level included)
+- **Plain files too** (like aria2c): point it at a direct file URL (`.mp4`, `.mkv`, `.zip`, anything) and it downloads over many byte-range connections at once, with the same resume/retry; single connection when the server won't do ranges
 - **Automation-friendly**: plain-line progress on non-TTY (no ANSI garbage in logs), real exit codes, quiet machine-readable output
 - Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth
 
@@ -284,8 +285,9 @@ How it's built — and why it's different from an FFmpeg restreamer:
   fMP4, real `BANDWIDTH`/`CODECS`/`RESOLUTION` in the master (measured, not
   guessed), source discontinuities passed through, and an output media sequence
   that can't be wedged by a source that rewinds its own numbering.
-- **Live and VOD.** A live source rolls a window; a finite source publishes the
-  whole thing and caps it with `EXT-X-ENDLIST`, then keeps serving until Ctrl-C.
+- **Live and VOD.** A live source rolls a window. A finite (VOD) source is served
+  as a **seekable** growing VOD instead — segments spool to disk (RAM stays flat)
+  and the whole timeline is scrubbable, gaining `EXT-X-ENDLIST` when it completes.
 
 Scope today: HLS and DASH output are copy-only (same container family, no
 FFmpeg); MPEG-TS output copies a TS source in pure Go and remuxes an fMP4 or
