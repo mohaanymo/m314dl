@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mohamed/m314dl/internal/engine"
 	"github.com/mohamed/m314dl/internal/manifest"
@@ -27,22 +28,36 @@ func dashPub(t *testing.T, live bool) (*Publisher, engine.Sink, engine.Sink) {
 	return pub, vs, as
 }
 
+// mpdAttr pulls one attribute value out of a rendered MPD.
+func mpdAttr(t *testing.T, m, name string) string {
+	t.Helper()
+	i := strings.Index(m, name+`="`)
+	if i < 0 {
+		t.Fatalf("MPD missing %s\n%s", name, m)
+	}
+	rest := m[i+len(name)+2:]
+	return rest[:strings.IndexByte(rest, '"')]
+}
+
 // A VOD still downloading must stay dynamic (a static MPD would be fetched
-// once, snapshotting the partial timeline) with DVR depth spanning the whole
-// untrimmed timeline so everything published is seekable.
+// once, snapshotting the partial timeline), yet every spooled segment must be
+// playable right away: the spool outruns the wall clock, so with AST at the
+// real start a player's availability math (AST + t + d ≤ now) would hide most
+// of what is on disk and playback would never start. AST is therefore
+// back-dated by a constant and no timeShiftBufferDepth is advertised.
 func TestDASHManifestVODGrowing(t *testing.T) {
 	pub, vs, as := dashPub(t, false)
-	feed(vs, 4, 4.0)
-	feed(as, 4, 4.0)
+	// Spool far more media than wall time has elapsed — the real failure mode.
+	feed(vs, 900, 6.0)
+	feed(as, 900, 6.0)
 	// no End: the source is still downloading
 
 	m := string(pub.DASHManifest())
 	for _, want := range []string{
 		`type="dynamic"`,
 		"minimumUpdatePeriod=",
-		`timeShiftBufferDepth="PT16S"`, // spans the whole 16s timeline
 		`startNumber="0"`,
-		`<S t="0" d="4000" r="3"/>`, // full timeline from t=0, untrimmed
+		`<S t="0" d="6000" r="899"/>`, // full timeline from t=0, untrimmed
 	} {
 		if !strings.Contains(m, want) {
 			t.Fatalf("growing VOD MPD missing %q\n%s", want, m)
@@ -50,6 +65,43 @@ func TestDASHManifestVODGrowing(t *testing.T) {
 	}
 	if strings.Contains(m, "mediaPresentationDuration") {
 		t.Fatalf("growing VOD MPD must not be a fixed-duration snapshot\n%s", m)
+	}
+	if strings.Contains(m, "timeShiftBufferDepth") {
+		t.Fatalf("growing VOD MPD must not bound the DVR window (a depth from a back-dated AST expires early segments)\n%s", m)
+	}
+
+	ast, err := time.Parse(isoTime, mpdAttr(t, m, "availabilityStartTime"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub2, err := time.Parse(isoTime, mpdAttr(t, m, "publishTime"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wall-clock gate: first and last listed segments (t+d) must already be
+	// available at publishTime even though 5400s of media spooled in ~0s.
+	if first := ast.Add(6 * time.Second); first.After(pub2) {
+		t.Fatalf("first segment not yet available: AST+d=%v > publishTime %v", first, pub2)
+	}
+	if last := ast.Add(900 * 6 * time.Second); last.After(pub2) {
+		t.Fatalf("last spooled segment gated by wall clock: AST+t+d=%v > publishTime %v", last, pub2)
+	}
+
+	// AST must be a constant: a manifest refresh moments later re-anchors
+	// nothing.
+	time.Sleep(15 * time.Millisecond)
+	if again := mpdAttr(t, string(pub.DASHManifest()), "availabilityStartTime"); again != ast.Format(isoTime) {
+		t.Fatalf("availabilityStartTime moved between refreshes: %s -> %s", ast.Format(isoTime), again)
+	}
+
+	// Completion flips to a plain static VOD.
+	pub.End()
+	m = string(pub.DASHManifest())
+	if !strings.Contains(m, `type="static"`) || !strings.Contains(m, `mediaPresentationDuration="PT5400.000S"`) {
+		t.Fatalf("ended VOD MPD should be static with full duration\n%s", m)
+	}
+	if strings.Contains(m, "availabilityStartTime") || strings.Contains(m, "minimumUpdatePeriod") {
+		t.Fatalf("static MPD must not carry dynamic attributes\n%s", m)
 	}
 }
 

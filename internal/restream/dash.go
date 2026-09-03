@@ -20,13 +20,28 @@ import (
 // A dynamic (live) MPD advertises minimumUpdatePeriod so players re-fetch it;
 // a static (VOD) MPD lists the whole timeline and a mediaPresentationDuration.
 // A VOD still downloading must be dynamic — a static MPD is fetched once, so a
-// player would snapshot the partial timeline and stop there — but with a
-// timeShiftBufferDepth spanning the whole (untrimmed) timeline, so everything
-// published so far stays seekable; it flips to static once the source
-// completes. DASH segments are fMP4 — a TS source must be remuxed first (a
-// later phase), which the coordinator enforces before choosing this output.
+// player would snapshot the partial timeline and stop there — with its
+// availabilityStartTime back-dated (see vodAvailabilityBackdate) and no
+// timeShiftBufferDepth, so every spooled segment is playable and seekable the
+// moment the timeline lists it; it flips to static once the source completes.
+// DASH segments are fMP4 — a TS source must be remuxed first (a later phase),
+// which the coordinator enforces before choosing this output.
 
 const isoTime = "2006-01-02T15:04:05Z"
+
+// vodAvailabilityBackdate is how far before the run started a growing VOD's
+// availabilityStartTime is placed. A dynamic MPD gates each segment behind the
+// wall clock — segment N is playable only once AST + N×duration has passed —
+// but a VOD spools to disk far faster than real time, so anchored at the real
+// start a compliant player sees almost everything on disk as "not yet
+// available" and never starts. Back-dating by more than any asset's length
+// makes AST + t + d ≤ now hold for every segment the timeline can list, and
+// the SegmentTimeline (which lists only spooled segments) stays the sole
+// limiter on what exists. The value is a fixed offset from p.start, never from
+// now: a moving AST is a spec violation and re-anchors players every refresh.
+// ponytail: a 24h constant covers any real VOD; thread the source's own
+// duration through if a longer asset ever appears.
+const vodAvailabilityBackdate = 24 * time.Hour
 
 // DASHManifest renders the presentation as an MPD.
 func (p *Publisher) DASHManifest() []byte {
@@ -51,19 +66,16 @@ func (p *Publisher) DASHManifest() []byte {
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
 			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*float64(windowSize), td*3)
 	case !done:
-		// VOD mid-download: dynamic so players keep re-fetching, with DVR depth
-		// covering the entire timeline back to t=0 (nothing is ever trimmed) so
-		// everything published stays seekable. The spool can outgrow the wall
-		// clock, so a player that derives availability from now-AST may cap its
-		// range at wall-clock elapsed rather than the full spool — the phase is
-		// brief (the download is unpaced) and ends in a fully seekable static
-		// MPD, and every segment the timeline lists is truly fetchable.
-		total := p.totalDur()
-		if total < td {
-			total = td // no segments yet: never advertise a zero DVR window
-		}
-		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
-			p.start.UTC().Format(isoTime), now.Format(isoTime), td, total, td*3)
+		// VOD mid-download: dynamic so players keep re-fetching and the timeline
+		// keeps growing; availabilityStartTime back-dated by a constant so the
+		// wall clock never gates a spooled segment (see vodAvailabilityBackdate).
+		// No timeShiftBufferDepth: absent means infinite, so nothing from t=0 on
+		// ever ages out of the seekable range — a finite depth measured from a
+		// back-dated AST would instead expire every early segment. Players clamp
+		// the live edge to the last listed segment, so the untrimmed timeline is
+		// both the start point and the full seek range.
+		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
+			p.start.Add(-vodAvailabilityBackdate).UTC().Format(isoTime), now.Format(isoTime), td, td*3)
 	default:
 		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, p.totalDur())
 	}
