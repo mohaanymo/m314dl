@@ -13,6 +13,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -24,6 +26,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/mohamed/m314dl/internal/curl"
 	"github.com/mohamed/m314dl/internal/engine"
 	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
@@ -48,6 +51,7 @@ type options struct {
 	output           string
 	threads          int
 	headers          multiFlag
+	curl             string
 	cookies          string
 	proxy            string
 	insecure         bool
@@ -91,6 +95,7 @@ func run() error {
 	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4). Direct file: used as given, default the server's/URL's filename")
 	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream (direct file: parallel connections) — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
+	flag.StringVar(&o.curl, "curl", "", "take the URL and headers from a copy-as-curl command: a file path, '-' for stdin, or the command itself. -H overrides its headers")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
 	flag.BoolVar(&o.insecure, "insecure", false, "skip TLS certificate verification")
@@ -170,9 +175,26 @@ func run() error {
 			tPinned = true
 		}
 	})
+	// -curl: pull the URL and headers out of a pasted copy-as-curl command. An
+	// explicit positional URL still wins; -H below still overrides its headers.
+	var curlHeaders map[string]string
+	if o.curl != "" {
+		cmd, err := readCurlSource(o.curl)
+		if err != nil {
+			return fmt.Errorf("-curl: %w", err)
+		}
+		u, h, err := curl.Parse(cmd)
+		if err != nil {
+			return fmt.Errorf("-curl: %w", err)
+		}
+		curlHeaders = h
+		if len(positionals) == 0 {
+			positionals = []string{u}
+		}
+	}
 	if len(positionals) != 1 {
 		flag.Usage()
-		return fmt.Errorf("exactly one URL required")
+		return fmt.Errorf("exactly one URL required (or -curl)")
 	}
 	inputURL := positionals[0]
 
@@ -183,12 +205,15 @@ func run() error {
 	}
 
 	headers := map[string]string{}
-	for _, h := range o.headers {
+	for k, v := range curlHeaders { // from -curl, if any
+		headers[k] = v
+	}
+	for _, h := range o.headers { // explicit -H overrides a curl header
 		k, v, ok := strings.Cut(h, ":")
 		if !ok {
 			return fmt.Errorf("bad header %q (want 'Key: Value')", h)
 		}
-		headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		headers[http.CanonicalHeaderKey(strings.TrimSpace(k))] = strings.TrimSpace(v)
 	}
 	client, err := httpx.New(httpx.Options{
 		Headers: headers, Proxy: o.proxy, CookieFile: o.cookies,
@@ -537,6 +562,20 @@ func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map
 		cand = fmt.Sprintf("%s.%s.%s.%s", base, tag, source.SanitizeTag(extra), format)
 	}
 	return cand
+}
+
+// readCurlSource resolves the -curl value: "-" reads stdin, an existing file is
+// read, and anything else is treated as the curl command itself (so a shell
+// heredoc, a saved file, or an inline string all work).
+func readCurlSource(v string) (string, error) {
+	if v == "-" {
+		b, err := io.ReadAll(os.Stdin)
+		return string(b), err
+	}
+	if b, err := os.ReadFile(v); err == nil {
+		return string(b), nil
+	}
+	return v, nil
 }
 
 func outputPath(out, inputURL string, live bool) string {

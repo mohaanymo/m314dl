@@ -110,6 +110,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
 - **Plain files too** (like aria2c): point it at a direct file URL (`.mp4`, `.mkv`, `.zip`, anything) and it downloads over many byte-range connections at once, with the same resume/retry; single connection when the server won't do ranges
 - **Automation-friendly**: plain-line progress on non-TTY (no ANSI garbage in logs), real exit codes, quiet machine-readable output
 - Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth
+- **Paste a curl command** (`-curl`): for a URL that needs specific headers, hand it a browser's "Copy as cURL" (a file, `-` for stdin, or inline) and it takes the URL + all headers for you, instead of typing each `-H`
 
 **Scope of decryption.** m314dl decrypts when you provide the key. It does not
 run a license/CDM handshake, and HLS SAMPLE-AES and HLS-CMAF CENC key parsing
