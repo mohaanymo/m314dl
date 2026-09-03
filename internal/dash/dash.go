@@ -52,6 +52,7 @@ type adaptXML struct {
 	SegmentList       *listXML  `xml:"SegmentList"`
 	ContentProtection []cpXML   `xml:"ContentProtection"`
 	Roles             []roleXML `xml:"Role"`
+	Essential         []propXML `xml:"EssentialProperty"`
 	Representations   []repXML  `xml:"Representation"`
 }
 
@@ -59,21 +60,26 @@ type roleXML struct {
 	Value string `xml:"value,attr"`
 }
 
+type propXML struct {
+	SchemeIDURI string `xml:"schemeIdUri,attr"`
+}
+
 type repXML struct {
-	ID                string   `xml:"id,attr"`
-	Bandwidth         int64    `xml:"bandwidth,attr"`
-	Width             int      `xml:"width,attr"`
-	Height            int      `xml:"height,attr"`
-	Codecs            string   `xml:"codecs,attr"`
-	MimeType          string   `xml:"mimeType,attr"`
-	FrameRate         string   `xml:"frameRate,attr"`
-	Lang              string   `xml:"lang,attr"`
-	BaseURL           []string `xml:"BaseURL"`
-	SegmentTemplate   *tmplXML `xml:"SegmentTemplate"`
-	SegmentList       *listXML `xml:"SegmentList"`
-	SegmentBase       *baseXML `xml:"SegmentBase"`
-	ContentProtection []cpXML  `xml:"ContentProtection"`
-	AudioChannels     []acXML  `xml:"AudioChannelConfiguration"`
+	ID                string    `xml:"id,attr"`
+	Bandwidth         int64     `xml:"bandwidth,attr"`
+	Width             int       `xml:"width,attr"`
+	Height            int       `xml:"height,attr"`
+	Codecs            string    `xml:"codecs,attr"`
+	MimeType          string    `xml:"mimeType,attr"`
+	FrameRate         string    `xml:"frameRate,attr"`
+	Lang              string    `xml:"lang,attr"`
+	BaseURL           []string  `xml:"BaseURL"`
+	SegmentTemplate   *tmplXML  `xml:"SegmentTemplate"`
+	SegmentList       *listXML  `xml:"SegmentList"`
+	SegmentBase       *baseXML  `xml:"SegmentBase"`
+	ContentProtection []cpXML   `xml:"ContentProtection"`
+	AudioChannels     []acXML   `xml:"AudioChannelConfiguration"`
+	Essential         []propXML `xml:"EssentialProperty"`
 }
 
 type acXML struct {
@@ -161,6 +167,9 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 		for ai, as := range p.AdaptationSets {
 			aBase := resolveChain(pBase, as.BaseURL)
 			for ri, rep := range as.Representations {
+				if isTrickMode(&as, &rep) {
+					continue
+				}
 				rBase := resolveChain(aBase, rep.BaseURL)
 				st := buildStream(&as, &rep, ai, ri)
 				st.Live = live
@@ -220,6 +229,23 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 		periodStart += pDur
 	}
 	return m, nil
+}
+
+// trickModeScheme is the DASH-IF EssentialProperty that marks a trick-play
+// track (I-frame only, frameRate=1, maxPlayoutRate set). EssentialProperty
+// means a client that does not implement the scheme must ignore the element,
+// so such representations are dropped instead of offered as ordinary video —
+// they often tie with the real top rendition on height and bandwidth, and only
+// document order kept "best" from picking the 1 fps track.
+const trickModeScheme = "http://dashif.org/guidelines/trickmode"
+
+func isTrickMode(as *adaptXML, rep *repXML) bool {
+	for _, p := range append(as.Essential, rep.Essential...) {
+		if p.SchemeIDURI == trickModeScheme {
+			return true
+		}
+	}
+	return false
 }
 
 func buildStream(as *adaptXML, rep *repXML, ai, ri int) *manifest.Stream {

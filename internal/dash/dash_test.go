@@ -172,6 +172,57 @@ func TestSegmentBaseInit(t *testing.T) {
 	}
 }
 
+// mpdTrickMode mirrors a real CMAF VOD (issue #8): a trick-play AdaptationSet
+// whose representation ties the real top rendition on height and bandwidth,
+// and a SegmentTemplate whose nominal per-segment duration differs between
+// video and audio (539859 vs 539890 @90kHz) with no SegmentTimeline.
+const mpdTrickMode = `<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT5176.640S">
+ <Period id="period0" start="PT0.040S">
+  <AdaptationSet id="1" contentType="video" mimeType="video/mp4">
+   <SegmentTemplate timescale="90000" initialization="$RepresentationID$-init.m4s" media="$RepresentationID$-i-$Number$.m4s" startNumber="1" duration="539859" presentationDuration="465717600" presentationTimeOffset="3600"/>
+   <Representation id="v0" bandwidth="8000000" codecs="avc1.4d402a" width="1920" height="1080" frameRate="50"/>
+  </AdaptationSet>
+  <AdaptationSet id="2" contentType="video" mimeType="video/mp4">
+   <EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="1"/>
+   <Role schemeIdUri="urn:mpeg:dash:role:2011" value="alternate"/>
+   <SegmentTemplate timescale="90000" initialization="$RepresentationID$-initTrickMode.m4s" media="$RepresentationID$-i-TrickMode-$Number$.m4s" startNumber="1" duration="539859" presentationDuration="465717600" presentationTimeOffset="3600"/>
+   <Representation id="v0_tm" bandwidth="8000000" codecs="avc1.4d402a" width="1920" height="1080" frameRate="1" maxPlayoutRate="50.000"/>
+  </AdaptationSet>
+  <AdaptationSet id="3" contentType="audio" mimeType="audio/mp4" lang="spa">
+   <SegmentTemplate timescale="90000" initialization="$RepresentationID$-init.m4s" media="$RepresentationID$-i-$Number$.m4s" startNumber="1" duration="539890" presentationDuration="465744000" presentationTimeOffset="3600"/>
+   <Representation id="a0" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="48000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+
+func TestTrickModeDroppedAndTemplateCountsAgree(t *testing.T) {
+	m, err := Parse([]byte(mpdTrickMode), "https://ex.com/d/x.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Streams) != 2 {
+		t.Fatalf("streams = %d, want 2 (trick-mode rep dropped)", len(m.Streams))
+	}
+	v, a := m.Streams[0], m.Streams[1]
+	if v.Name != "v0" || v.Type != manifest.Video || a.Name != "a0" || a.Type != manifest.Audio {
+		t.Fatalf("streams = %v / %v", v, a)
+	}
+	// ceil(5176.640 / (539859/90000)) == ceil(5176.640 / (539890/90000)) == 863:
+	// the per-track nominal durations differ but the $Number$ range must not.
+	for _, st := range m.Streams {
+		if n := len(st.Segments); n != 863 {
+			t.Fatalf("%s segments = %d, want 863", st.Name, n)
+		}
+		if st.Segments[0].Seq != 1 || st.Segments[862].Seq != 863 {
+			t.Fatalf("%s seq range = %d..%d", st.Name, st.Segments[0].Seq, st.Segments[862].Seq)
+		}
+	}
+	if v.Segments[862].URL != "https://ex.com/d/v0-i-863.m4s" {
+		t.Fatalf("last video url = %s", v.Segments[862].URL)
+	}
+}
+
 func TestISODuration(t *testing.T) {
 	if d := parseISODuration("PT1H2M3.5S"); d != 3723.5 {
 		t.Fatalf("d = %v", d)
