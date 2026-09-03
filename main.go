@@ -37,6 +37,7 @@ import (
 	"github.com/mohamed/m314dl/internal/serve"
 	"github.com/mohamed/m314dl/internal/source"
 	"github.com/mohamed/m314dl/internal/subs"
+	"github.com/mohamed/m314dl/internal/update"
 	"github.com/mohamed/m314dl/internal/worker"
 )
 
@@ -56,6 +57,7 @@ type options struct {
 	proxy            string
 	insecure         bool
 	retries          int
+	noUpdateCheck    bool
 	listOnly         bool
 	sv, sa, ss       string
 	adKeywords       multiFlag
@@ -96,6 +98,7 @@ func run() error {
 	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream (direct file: parallel connections) — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.curl, "curl", "", "take the URL and headers from a copy-as-curl command: a file path, '-' for stdin, or the command itself. For a browser copy-as-curl use a file or stdin — its quotes break an inline shell argument. -H overrides its headers")
+	flag.BoolVar(&o.noUpdateCheck, "no-update-check", false, "don't check GitHub for a newer release (also M314DL_NO_UPDATE_CHECK=1)")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
 	flag.BoolVar(&o.insecure, "insecure", false, "skip TLS certificate verification")
@@ -197,6 +200,10 @@ func run() error {
 		return fmt.Errorf("exactly one URL required (or -curl)")
 	}
 	inputURL := positionals[0]
+
+	// Nudge the user if a newer release exists. Runs in the background and its
+	// notice prints when run() returns, so it never delays the download.
+	defer printUpdateNotice(startUpdateCheck(&o))
 
 	logv := func(format string, args ...any) {
 		if o.verbose {
@@ -562,6 +569,41 @@ func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map
 		cand = fmt.Sprintf("%s.%s.%s.%s", base, tag, source.SanitizeTag(extra), format)
 	}
 	return cand
+}
+
+// startUpdateCheck kicks off a background GitHub version check unless disabled,
+// returning a channel that yields a newer tag (or "" / nil when off).
+func startUpdateCheck(o *options) <-chan string {
+	if o.noUpdateCheck || os.Getenv("M314DL_NO_UPDATE_CHECK") != "" {
+		return nil
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return nil
+	}
+	ch := make(chan string, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ch <- update.Check(ctx, version, dir)
+	}()
+	return ch
+}
+
+// printUpdateNotice prints the "new version" line if the check found one, but
+// waits only briefly so a slow network never holds up exit — a check that
+// hasn't finished simply reports next run.
+func printUpdateNotice(ch <-chan string) {
+	if ch == nil {
+		return
+	}
+	select {
+	case tag := <-ch:
+		if tag != "" {
+			fmt.Fprintf(os.Stderr, "\nA newer version %s is available (you have %s): %s\n", tag, version, update.Page)
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 // readCurlSource resolves the -curl value: "-" reads stdin, an existing file is

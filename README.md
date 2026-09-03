@@ -116,6 +116,7 @@ m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
   curl 'https://host/master.m3u8' -H 'referer: https://site/' -H 'user-agent: …'
   CURL
   ```
+- **Update check**: once a day it checks GitHub for a newer release and prints a one-line notice if you're behind (never blocks the download; `-no-update-check` or `M314DL_NO_UPDATE_CHECK=1` turns it off)
 
 **Scope of decryption.** m314dl decrypts when you provide the key. It does not
 run a license/CDM handshake, and HLS SAMPLE-AES and HLS-CMAF CENC key parsing
