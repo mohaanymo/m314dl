@@ -95,7 +95,7 @@ func run() error {
 	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4). Direct file: used as given, default the server's/URL's filename")
 	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream (direct file: parallel connections) — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
-	flag.StringVar(&o.curl, "curl", "", "take the URL and headers from a copy-as-curl command: a file path, '-' for stdin, or the command itself. -H overrides its headers")
+	flag.StringVar(&o.curl, "curl", "", "take the URL and headers from a copy-as-curl command: a file path, '-' for stdin, or the command itself. For a browser copy-as-curl use a file or stdin — its quotes break an inline shell argument. -H overrides its headers")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
 	flag.BoolVar(&o.insecure, "insecure", false, "skip TLS certificate verification")
