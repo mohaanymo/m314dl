@@ -41,6 +41,10 @@ type Config struct {
 	FromStart bool            // live: download the whole DVR window instead of starting at the edge
 	Progress  *Progress       // shared across streams; may be nil
 	Verbose   func(format string, args ...any)
+	// Verbatim commits segment bytes exactly as received: no fake-image-header
+	// strip, no decryption. A plain file's chunks are its own bytes — a PNG
+	// or a chunk that happens to start with 0xFFD8 must not be "de-obfuscated".
+	Verbatim bool
 	// PaceRealtime throttles a Sink restream to the source's real playback rate.
 	// A finite (VOD) source otherwise downloads flat-out and floods the live
 	// output — overrunning a TS viewer's buffer or piling the whole asset into the
@@ -135,7 +139,11 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	// single-segment stream (SegmentBase / plain file): direct streaming path.
 	// Not taken when restreaming — a sink needs segment boundaries, not one blob.
 	if cfg.Sink == nil && !st.Live && len(st.Segments) == 1 && st.Segments[0].Key == nil && st.Segments[0].Range == nil {
-		return downloadSingleFile(ctx, cfg, st, outPath)
+		if err := downloadSingleFile(ctx, cfg, st, outPath); err != nil {
+			return err
+		}
+		os.Remove(statePath(outPath)) // stale checkpoint from a chunked attempt that fell back here
+		return nil
 	}
 
 	// File output opens the target and loads any resume checkpoint. Restreaming
@@ -806,7 +814,34 @@ func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecrypt
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)
 	}
 	defer os.Remove(part)
+	if cfg.Verbatim {
+		return data, nil
+	}
 	return decryptSegment(ctx, kc, dec, trackID, cfg.BBTSKey, cfg.Keys, it, data)
+}
+
+// ---- plain file ----
+
+// DownloadFile downloads a plain file whose stream is either one whole-object
+// segment (single connection) or consecutive byte-range chunks of the object
+// (parallel, resumable — the ordinary segment pipeline). A server that passed
+// the range probe but then answers a chunk with the whole object is caught by
+// the worker (ErrRangeIgnored) and the download restarts on one connection,
+// resuming from whatever contiguous prefix was already committed.
+func DownloadFile(ctx context.Context, cfg Config, st *manifest.Stream, outPath string) error {
+	if cfg.Verbose == nil {
+		cfg.Verbose = func(string, ...any) {}
+	}
+	cfg.Verbatim = true
+	cfg.AdFilters = nil // a URL filter meant for ad segments must not blank out the file
+	err := DownloadStream(ctx, cfg, st, outPath, nil)
+	if !errors.Is(err, ErrRangeIgnored) {
+		return err
+	}
+	cfg.Verbose("server ignored byte ranges; downloading on one connection")
+	single := *st
+	single.Segments = []manifest.Segment{{URL: st.Segments[0].URL}}
+	return DownloadStream(ctx, cfg, &single, outPath, nil)
 }
 
 // ---- single big file ----

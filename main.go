@@ -2,8 +2,9 @@
 //
 // Usage: m314dl [flags] <URL>
 // URL may be a master/media playlist (.m3u8), a DASH manifest (.mpd), a Smooth
-// Streaming manifest (.ism/Manifest), or a web page (m314dl scrapes it for
-// stream URLs).
+// Streaming manifest (.ism/Manifest), a web page (m314dl scrapes it for
+// stream URLs), or a plain file (mp4, mkv, zip, iso, …), which is fetched in
+// parallel byte ranges with resume and written as-is.
 package main
 
 import (
@@ -87,8 +88,8 @@ func main() {
 
 func run() error {
 	var o options
-	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4)")
-	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
+	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4). Direct file: used as given, default the server's/URL's filename")
+	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream (direct file: parallel connections) — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.cookies, "cookies", "", "Netscape cookies.txt file")
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
@@ -228,6 +229,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	threadCeiling := 0 // 0 = auto-tune (no -t given)
+	if tPinned {
+		threadCeiling = o.threads
+	}
+	if kind == source.FileKind {
+		return downloadFile(ctx, cancel, &o, client, master.Streams[0], threadCeiling, logv)
+	}
 
 	ve, err := pick.ParseExpr(o.sv)
 	if err != nil {
@@ -287,10 +295,6 @@ func run() error {
 
 	// Restream mode: republish live HLS over HTTP instead of downloading a file.
 	if o.serve != "" {
-		threadCeiling := 0
-		if tPinned {
-			threadCeiling = o.threads
-		}
 		return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath},
 			client, kind, selected, keys, bbtsKey, threadCeiling, logv)
 	}
@@ -302,33 +306,12 @@ func run() error {
 		return fmt.Errorf("ffmpeg not found (needed for muxing; pass -ffmpeg <path>, or -no-mux to skip): %w", ffErr)
 	}
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		if live {
-			// live: stop discovering, drain pipeline, mux what we have
-			fmt.Fprintln(os.Stderr, "\ninterrupt: finishing recording (press again to abort)")
-			close(stopLive)
-		} else {
-			// VOD: cancel now; resume state lets the next run continue
-			fmt.Fprintln(os.Stderr, "\ninterrupt: stopping (rerun the same command to resume)")
-			cancel()
-		}
-		<-sigCh
-		fmt.Fprintln(os.Stderr, "aborted")
-		cancel()
-		os.Exit(130)
-	}()
+	interruptHandler(live, stopLive, cancel)
 
 	prog := engine.NewProgress(live, o.progressInterval)
 	progStop := make(chan struct{})
 	go prog.Render(progStop)
 
-	threadCeiling := 0 // 0 = auto-tune (no -t given)
-	if tPinned {
-		threadCeiling = o.threads
-	}
 	cfg := engine.Config{
 		Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey, AdFilters: adFilters,
 		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
@@ -476,6 +459,62 @@ func run() error {
 		for _, r := range results { // raw subtitle payloads too
 			os.Remove(r.path)
 		}
+	}
+	fmt.Fprintln(os.Stderr, "done: "+outPath)
+	return nil
+}
+
+// interruptHandler makes the first Ctrl-C/SIGTERM stop the download cleanly — a
+// live recording finishes up (stopLive closed), a VOD cancels so the next run
+// resumes — and a second one abort outright.
+func interruptHandler(live bool, stopLive chan struct{}, cancel context.CancelFunc) {
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		if live {
+			// live: stop discovering, drain pipeline, mux what we have
+			fmt.Fprintln(os.Stderr, "\ninterrupt: finishing recording (press again to abort)")
+			close(stopLive)
+		} else {
+			// VOD: cancel now; resume state lets the next run continue
+			fmt.Fprintln(os.Stderr, "\ninterrupt: stopping (rerun the same command to resume)")
+			cancel()
+		}
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "aborted")
+		cancel()
+		os.Exit(130)
+	}()
+}
+
+// downloadFile writes a direct file straight to its output path: no stream
+// selection, no temp file, no mux — the bytes are the deliverable. -o is used
+// as given (no container extension is forced); otherwise the server's or the
+// URL's filename, extension and all.
+func downloadFile(ctx context.Context, cancel context.CancelFunc, o *options, client *httpx.Client, st *manifest.Stream, threads int, logv func(string, ...any)) error {
+	outPath := o.output
+	if outPath == "" {
+		outPath = st.Name
+	}
+	size := "size unknown"
+	if n := source.FileSize(st); n >= 0 {
+		size = fmt.Sprintf("%d bytes", n)
+	}
+	if o.listOnly {
+		fmt.Printf("file %s (%s)\n", st.Name, size)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "file: %s (%s)\n", outPath, size)
+	interruptHandler(false, nil, cancel)
+	prog := engine.NewProgress(false, o.progressInterval)
+	progStop := make(chan struct{})
+	go prog.Render(progStop)
+	err := engine.DownloadFile(ctx, engine.Config{Client: client, Threads: threads, Progress: prog, Verbose: logv}, st, outPath)
+	close(progStop)
+	time.Sleep(50 * time.Millisecond) // let renderer print the final line
+	if err != nil {
+		return err
 	}
 	fmt.Fprintln(os.Stderr, "done: "+outPath)
 	return nil

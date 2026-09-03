@@ -231,11 +231,40 @@ func (c *Client) FetchBytes(ctx context.Context, rawURL, rangeHdr string) ([]byt
 // exponential backoff+jitter, and honor a Retry-After header when present.
 func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (body []byte, finalURL string, pressure int, err error) {
 	finalURL = rawURL
+	pressure, err = c.retry(ctx, func() error {
+		var err error
+		body, finalURL, err = c.fetchOnce(ctx, rawURL, rangeHdr)
+		return err
+	})
+	if err != nil {
+		return nil, finalURL, pressure, err
+	}
+	return body, finalURL, pressure, nil
+}
+
+// Open GETs a URL (optionally with a Range header) with FetchBytes's retry
+// policy and hands back the response with its body unread, for a caller that
+// needs the headers before deciding whether to read the body at all. The
+// caller owns resp.Body; a mid-body read error is its to handle.
+func (c *Client) Open(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
+	var resp *http.Response
+	_, err := c.retry(ctx, func() error {
+		var err error
+		resp, err = c.openOnce(ctx, rawURL, rangeHdr)
+		return err
+	})
+	return resp, err
+}
+
+// retry runs op until it succeeds, fails for good (a non-retriable status),
+// runs out of attempts, or ctx ends — exponential backoff with jitter, honoring
+// a capped Retry-After. Returns how many times the server pushed back with a
+// retriable status.
+func (c *Client) retry(ctx context.Context, op func() error) (pressure int, err error) {
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
-		body, finalURL, err = c.fetchOnce(ctx, rawURL, rangeHdr)
-		if err == nil {
-			return body, finalURL, pressure, nil
+		if err = op(); err == nil {
+			return pressure, nil
 		}
 		var se *StatusError
 		isStatus := errors.As(err, &se)
@@ -244,7 +273,7 @@ func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (bod
 		}
 		permanent := isStatus && !retriable(se.Code)
 		if permanent || attempt >= c.retries || ctx.Err() != nil {
-			return nil, finalURL, pressure, err
+			return pressure, err
 		}
 		wait := backoff + time.Duration(rand.Int64N(int64(backoff/2)))
 		if isStatus && se.RetryAfter > 0 { // honor Retry-After, capped
@@ -255,7 +284,7 @@ func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (bod
 		}
 		select {
 		case <-ctx.Done():
-			return nil, finalURL, pressure, ctx.Err()
+			return pressure, ctx.Err()
 		case <-time.After(wait):
 		}
 		if backoff < 8*time.Second {
@@ -264,27 +293,42 @@ func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (bod
 	}
 }
 
-func (c *Client) fetchOnce(ctx context.Context, rawURL, rangeHdr string) ([]byte, string, error) {
+// openOnce sends one GET; a 4xx/5xx becomes a StatusError with the body drained.
+func (c *Client) openOnce(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, rawURL, err
+		return nil, err
 	}
 	if rangeHdr != "" {
 		req.Header.Set("Range", rangeHdr)
 	}
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, rawURL, err
-	}
-	defer resp.Body.Close()
-	final := rawURL
-	if resp.Request != nil && resp.Request.URL != nil {
-		final = resp.Request.URL.String()
+		return nil, err
 	}
 	if resp.StatusCode >= 400 {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, final, &StatusError{Code: resp.StatusCode, URL: rawURL, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+		resp.Body.Close()
+		return nil, &StatusError{Code: resp.StatusCode, URL: rawURL, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
+	return resp, nil
+}
+
+// FinalURL is the post-redirect URL a response was served from.
+func FinalURL(resp *http.Response, fallback string) string {
+	if resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return fallback
+}
+
+func (c *Client) fetchOnce(ctx context.Context, rawURL, rangeHdr string) ([]byte, string, error) {
+	resp, err := c.openOnce(ctx, rawURL, rangeHdr)
+	if err != nil {
+		return nil, rawURL, err
+	}
+	defer resp.Body.Close()
+	final := FinalURL(resp, rawURL)
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, final, fmt.Errorf("read body: %w", err)

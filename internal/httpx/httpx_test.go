@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -55,6 +56,39 @@ func TestFetchBytesExPressure(t *testing.T) {
 	}
 	if pressure != 2 {
 		t.Fatalf("pressure = %d, want 2 (two 429s before success)", pressure)
+	}
+}
+
+// Open shares FetchBytes's retry policy but hands back the response unread.
+func TestOpenRetriesThenReturnsUnreadBody(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/missing" {
+			http.NotFound(w, r)
+			return
+		}
+		if hits.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write([]byte("payload"))
+	}))
+	defer srv.Close()
+	c, _ := New(Options{Retries: 5})
+	resp, err := c.Open(context.Background(), srv.URL, "")
+	if err != nil {
+		t.Fatalf("should recover after 503s: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("Content-Type") != "application/octet-stream" || resp.ContentLength != 7 {
+		t.Fatalf("headers not surfaced: %v len %d", resp.Header, resp.ContentLength)
+	}
+	if b, _ := io.ReadAll(resp.Body); string(b) != "payload" {
+		t.Fatalf("body = %q", b)
+	}
+	if _, err := c.Open(context.Background(), srv.URL+"/missing", ""); err == nil {
+		t.Fatal("404 should error")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -79,7 +80,9 @@ func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 }
 
 // LoadManifest fetches the input, sniffs HLS/DASH/MSS, and falls back to
-// scraping when the input is a web page.
+// scraping when the input is a web page. A direct file (anything binary, or
+// served as an attachment) comes back as a single-stream master of kind
+// FileKind whose segments are the file's byte ranges — see file.go.
 func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
 	// Local manifest file (path or file://): some providers sign the playlist
 	// per request and hand it over as text rather than a URL.
@@ -95,9 +98,30 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 		}
 		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH/MSS manifest", path)
 	}
-	body, finalURL, err := client.FetchBytes(ctx, inputURL, "")
+	// Open rather than fetch: the headers and the first bytes say whether this
+	// is a file, and a multi-gigabyte file must not be read into memory to
+	// find that out.
+	resp, err := client.Open(ctx, inputURL, "")
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
+	}
+	defer resp.Body.Close()
+	finalURL := httpx.FinalURL(resp, inputURL)
+	head, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err == nil && isDirectFile(resp, head) {
+		logv("input is a direct file (%s)", resp.Header.Get("Content-Type"))
+		return fileMaster(ctx, client, resp, finalURL, logv), FileKind, nil
+	}
+	var rest []byte
+	if err == nil {
+		rest, err = io.ReadAll(resp.Body)
+	}
+	body := append(head, rest...)
+	if err != nil {
+		// mid-body failure: FetchBytes retries the whole read
+		if body, finalURL, err = client.FetchBytes(ctx, inputURL, ""); err != nil {
+			return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
+		}
 	}
 	if m, kind, err, ok := parseManifest(body, finalURL); ok {
 		return m, kind, err

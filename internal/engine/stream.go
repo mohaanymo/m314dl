@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -80,6 +81,7 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			continue
 		}
 
+		body := io.Reader(resp.Body)
 		switch {
 		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 			resp.Body.Close()
@@ -97,6 +99,20 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			f.Seek(0, io.SeekStart)
 			have = 0
 			continue
+		case resp.StatusCode == http.StatusOK && it.rng != nil && segStart > 0 && resp.ContentLength != segLen:
+			// Ranged segment answered with the whole object (a 200 whose length is
+			// not the slice's). Writing it as the segment would put the object's
+			// head where this slice belongs, so refuse rather than corrupt.
+			resp.Body.Close()
+			wd.Stop()
+			cancel()
+			f.Close()
+			os.Remove(path) // empty; don't litter the output dir
+			return pressure, ErrRangeIgnored
+		case resp.StatusCode == http.StatusOK && it.rng != nil && segLen >= 0:
+			// Slice from offset 0 answered with the whole object: it starts where
+			// the slice starts, so keep the slice's length and drop the rest.
+			body = io.LimitReader(resp.Body, segLen)
 		case resp.StatusCode >= 400:
 			code := resp.StatusCode
 			ra := httpx.ParseRetryAfter(resp.Header.Get("Retry-After"))
@@ -118,13 +134,18 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 
 		// 2xx: stream the body to disk, counting bytes as they arrive. Each byte
 		// received re-arms the watchdog, so a live-but-slow transfer is never cut.
-		n, rerr := streamBody(resp.Body, f, cfg.Progress, ctl, func() {
+		n, rerr := streamBody(body, f, cfg.Progress, ctl, func() {
 			wd.Reset(segIdleTimeout)
 		})
 		resp.Body.Close()
 		wd.Stop()
 		cancel()
 		have += n
+		if rerr == nil && segLen >= 0 && have < segLen {
+			// A 206 shorter than the slice asked for (some CDNs cap a range's
+			// length): not done yet. Retry below picks up at the bytes we have.
+			rerr = io.ErrUnexpectedEOF
+		}
 		if rerr == nil {
 			return pressure, nil // complete
 		}
@@ -141,6 +162,11 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 		}
 	}
 }
+
+// ErrRangeIgnored reports a server that answered a byte-range request for a
+// slice past offset 0 with 200 and the whole object. The segment fails rather
+// than corrupting the output; DownloadFile falls back to one connection.
+var ErrRangeIgnored = errors.New("server ignored Range request")
 
 // segIdleTimeout bounds how long a single segment fetch may receive no bytes
 // before it is abandoned and retried. Generous enough that a slow-but-alive
