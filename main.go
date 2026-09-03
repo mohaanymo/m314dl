@@ -1,8 +1,9 @@
-// m314dl — HLS/DASH media downloader.
+// m314dl — HLS/DASH/MSS media downloader.
 //
 // Usage: m314dl [flags] <URL>
-// URL may be a master/media playlist (.m3u8), a DASH manifest (.mpd), or a
-// web page (m314dl scrapes it for stream URLs).
+// URL may be a master/media playlist (.m3u8), a DASH manifest (.mpd), a Smooth
+// Streaming manifest (.ism/Manifest), or a web page (m314dl scrapes it for
+// stream URLs).
 package main
 
 import (
@@ -122,7 +123,7 @@ func run() error {
 	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
+		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH/MSS media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
 		flag.PrintDefaults()
 	}
 	// Flags may appear in any order relative to the URL. Go's flag package stops

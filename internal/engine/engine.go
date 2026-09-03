@@ -104,15 +104,21 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	// which reaches the player as a black picture with working audio and no
 	// error raised anywhere along the way.
 	var dec *cencDecryptor
+	var trackID uint32 // the init's sole track; fragments are retagged to it
 	switch {
 	case st.Init != nil && st.Init.URL != "":
 		// fMP4, including fMP4 SAMPLE-AES (which is the cbcs CENC scheme): the
 		// init segment's tenc/schm decides the scheme and the CENC path handles it.
-		d, err := newCencDecryptor(ctx, cfg, st)
+		initSeg, err := fetchInit(ctx, cfg, st)
+		if err != nil {
+			return err
+		}
+		d, err := newCencDecryptor(ctx, cfg, st, initSeg)
 		if err != nil {
 			return err
 		}
 		dec = d // nil when the init shows the stream is not encrypted
+		trackID = mp4.SoleTrackID(initSeg)
 	case streamIsCENC(st):
 		return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
 	}
@@ -189,9 +195,9 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	writerDone := make(chan error, 1)
 	go func() {
 		if cfg.Sink != nil {
-			writerDone <- sinkWriter(ctx, cfg, st.Live, outPath, state, kc, dec, results)
+			writerDone <- sinkWriter(ctx, cfg, st.Live, outPath, state, kc, dec, trackID, results)
 		} else {
-			writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, results)
+			writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, trackID, results)
 		}
 	}()
 
@@ -451,7 +457,8 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 
 // decryptSegment applies the same in-place transforms the old inline path did,
 // in the same order: strip fake image header, then CENC, then AES-128, then BBTS.
-func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsKey []byte, keys map[[16]byte][]byte, it item, data []byte) ([]byte, error) {
+// trackID is the fMP4 init's sole track (0 for TS or multi-track inits).
+func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, trackID uint32, bbtsKey []byte, keys map[[16]byte][]byte, it item, data []byte) ([]byte, error) {
 	data = stripFakeImageHeader(data)
 	// fMP4 CENC and fMP4 SAMPLE-AES (== cbcs) both decrypt through the CENC path;
 	// the init's tenc/schm already selected the scheme when dec was built.
@@ -510,6 +517,14 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, bbtsK
 	// output isn't flagged encrypted over now-plaintext samples.
 	if it.isInit && dec != nil {
 		data = mp4.SanitizeInit(data)
+	}
+	// fMP4 media: make the fragment agree with its init. A Smooth Streaming
+	// source has a synthesized init, so its PIFF fragments must be retagged to
+	// the init's track and given the tfdt they lack; a packaged DASH/HLS fragment
+	// already matches and passes through unchanged. Runs after the decrypt, which
+	// needs the original moof offsets.
+	if !it.isInit && trackID != 0 {
+		data = mp4.NormalizeFragment(data, trackID)
 	}
 	return data, nil
 }
@@ -679,7 +694,7 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 }
 
 // writer commits segments to a single output file with resume checkpointing.
-func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, trackID uint32, results <-chan result) error {
 	// commit decrypts one segment's part file and appends it to the output.
 	// ponytail: reads the whole part file into memory to decrypt (CENC/AES need
 	// the full segment); peak memory is one segment, not one per worker. A
@@ -689,7 +704,7 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 		if p.hole {
 			return nil
 		}
-		data, err := readDecrypt(ctx, cfg, kc, dec, outPath, idx, p.it)
+		data, err := readDecrypt(ctx, cfg, kc, dec, trackID, outPath, idx, p.it)
 		if err != nil {
 			return err
 		}
@@ -720,7 +735,7 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 
 // sinkWriter commits segments to a Sink (live restreaming) instead of a file:
 // same ordering and hole tolerance, no output file, no resume checkpoint.
-func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, results <-chan result) error {
+func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, trackID uint32, results <-chan result) error {
 	var (
 		paceStart  time.Time     // wall clock when realtime pacing began
 		mediaClock time.Duration // media time emitted since pacing began
@@ -730,7 +745,7 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 		if p.hole {
 			return nil
 		}
-		data, err := readDecrypt(ctx, cfg, kc, dec, outPath, idx, p.it)
+		data, err := readDecrypt(ctx, cfg, kc, dec, trackID, outPath, idx, p.it)
 		if err != nil {
 			return err
 		}
@@ -784,14 +799,14 @@ const pacePrimeSegments = 3
 // the decrypt fails: a worker killed and restarted across a bad stream would
 // otherwise leave its segments behind, and 1430 of those directories once ate
 // 43 GB nobody could see.
-func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, outPath string, idx int64, it item) ([]byte, error) {
+func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, trackID uint32, outPath string, idx int64, it item) ([]byte, error) {
 	part := partPath(outPath, idx)
 	data, err := os.ReadFile(part)
 	if err != nil {
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)
 	}
 	defer os.Remove(part)
-	return decryptSegment(ctx, kc, dec, cfg.BBTSKey, cfg.Keys, it, data)
+	return decryptSegment(ctx, kc, dec, trackID, cfg.BBTSKey, cfg.Keys, it, data)
 }
 
 // ---- single big file ----

@@ -18,6 +18,7 @@ import (
 	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mss"
 	"github.com/mohamed/m314dl/internal/scrape"
 )
 
@@ -77,7 +78,7 @@ func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 	return out, nil
 }
 
-// LoadManifest fetches the input, sniffs HLS/DASH, and falls back to
+// LoadManifest fetches the input, sniffs HLS/DASH/MSS, and falls back to
 // scraping when the input is a web page.
 func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
 	// Local manifest file (path or file://): some providers sign the playlist
@@ -89,27 +90,17 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 		}
 		base := localBaseURL(path)
 		logv("local manifest %s (base %s)", path, base)
-		switch {
-		case hls.IsHLS(body):
-			m, err := hls.ParseMaster(body, base)
-			return m, "hls", err
-		case dash.IsDASH(body):
-			m, err := dash.Parse(body, base)
-			return m, "dash", err
+		if m, kind, err, ok := parseManifest(body, base); ok {
+			return m, kind, err
 		}
-		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH manifest", path)
+		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH/MSS manifest", path)
 	}
 	body, finalURL, err := client.FetchBytes(ctx, inputURL, "")
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
 	}
-	if hls.IsHLS(body) {
-		m, err := hls.ParseMaster(body, finalURL)
-		return m, "hls", err
-	}
-	if dash.IsDASH(body) {
-		m, err := dash.Parse(body, finalURL)
-		return m, "dash", err
+	if m, kind, err, ok := parseManifest(body, finalURL); ok {
+		return m, kind, err
 	}
 	// probably a web page: scrape it
 	logv("input is not a manifest; scraping page for stream URLs")
@@ -118,7 +109,7 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 		return nil, "", err
 	}
 	if len(candidates) == 0 {
-		return nil, "", fmt.Errorf("no HLS/DASH manifest found at %s (not a playlist, and page scan found no stream URLs)", inputURL)
+		return nil, "", fmt.Errorf("no HLS/DASH/MSS manifest found at %s (not a playlist, and page scan found no stream URLs)", inputURL)
 	}
 	for _, c := range candidates {
 		fmt.Fprintln(os.Stderr, "found stream: "+c)
@@ -129,15 +120,27 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch scraped %s: %w", first, err)
 	}
-	switch {
-	case hls.IsHLS(body):
-		m, err := hls.ParseMaster(body, finalURL)
-		return m, "hls", err
-	case dash.IsDASH(body):
-		m, err := dash.Parse(body, finalURL)
-		return m, "dash", err
+	if m, kind, err, ok := parseManifest(body, finalURL); ok {
+		return m, kind, err
 	}
 	return nil, "", fmt.Errorf("scraped URL %s is not a recognizable manifest", first)
+}
+
+// parseManifest sniffs the manifest format and parses it; ok is false when the
+// body is none of them (a web page, most likely).
+func parseManifest(body []byte, baseURL string) (m *manifest.Master, kind string, err error, ok bool) {
+	switch {
+	case hls.IsHLS(body):
+		m, err = hls.ParseMaster(body, baseURL)
+		return m, "hls", err, true
+	case dash.IsDASH(body):
+		m, err = dash.Parse(body, baseURL)
+		return m, "dash", err, true
+	case mss.IsMSS(body):
+		m, err = mss.Parse(body, baseURL)
+		return m, "mss", err, true
+	}
+	return nil, "", nil, false
 }
 
 // RefreshFunc re-fetches a live stream's playlist so the engine sees new segments.
@@ -155,7 +158,14 @@ func RefreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv fu
 			}
 			return &fresh, nil
 		}
-		m, err := dash.Parse(body, finalURL)
+		// DASH and Smooth: the whole manifest is re-parsed and the track found by
+		// its (stable) ID.
+		var m *manifest.Master
+		if kind == "mss" {
+			m, err = mss.Parse(body, finalURL)
+		} else {
+			m, err = dash.Parse(body, finalURL)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -164,8 +174,8 @@ func RefreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv fu
 				return cand, nil
 			}
 		}
-		logv("live: stream %s missing from refreshed MPD", st.ID)
-		return nil, fmt.Errorf("stream %s no longer in MPD", st.ID)
+		logv("live: stream %s missing from refreshed manifest", st.ID)
+		return nil, fmt.Errorf("stream %s no longer in manifest", st.ID)
 	}
 }
 

@@ -216,7 +216,13 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		case "trun":
 			trunSizes, trunDataOff, haveTrun = parseTrun(b)
 		case "senc":
-			sencIVs, sencSubs, haveSenc = parseSenc(b, info.PerSampleIVLen)
+			sencIVs, sencSubs, haveSenc = parseSencAuto(b.payload, info.PerSampleIVLen)
+		case "uuid":
+			// PIFF 1.1 SampleEncryptionBox: senc's ancestor, same layout after the
+			// 16-byte extended type, plus optional AlgorithmID/IV_size/KID overrides.
+			if isUUID(b, uuidPiffSenc) {
+				sencIVs, sencSubs, haveSenc = parsePiffSenc(b, info.PerSampleIVLen)
+			}
 		case "saiz":
 			saizDefault, saizSizes, haveSaiz = parseSaiz(b)
 		case "saio":
@@ -477,8 +483,47 @@ func parseTrun(b box) (sizes []uint32, dataOff int64, ok bool) {
 	return sizes, dataOff, true
 }
 
-func parseSenc(b box, ivLen int) (ivs [][]byte, subs [][]subsample, ok bool) {
-	_, flags, rest, err := fullBox(b.payload)
+// parseSencAuto parses a senc payload with the init's IV size, falling back to
+// the other common size (8 ↔ 16) when the entries don't tile the box with the
+// declared one. A Smooth Streaming init is synthesized and its tenc IV size is a
+// guess; a wrong guess would otherwise decrypt to silent garbage. The exact-fit
+// check runs first; a box that fits neither size keeps the lenient parse.
+func parseSencAuto(payload []byte, ivLen int) (ivs [][]byte, subs [][]subsample, ok bool) {
+	if ivs, subs, ok = parseSencPayload(payload, ivLen, true); ok {
+		return ivs, subs, true
+	}
+	if alt := map[int]int{8: 16, 16: 8}[ivLen]; alt != 0 {
+		if ivs, subs, ok = parseSencPayload(payload, alt, true); ok {
+			return ivs, subs, true
+		}
+	}
+	return parseSencPayload(payload, ivLen, false)
+}
+
+// parsePiffSenc parses the PIFF SampleEncryptionBox (uuid A2394F52-…): after
+// the extended type it is a senc, except that flag 0x1 prefixes an
+// AlgorithmID(3)/IV_size(1)/KID(16) override whose IV size wins.
+func parsePiffSenc(b box, ivLen int) ([][]byte, [][]subsample, bool) {
+	p := b.payload[16:]
+	_, flags, rest, err := fullBox(p)
+	if err != nil {
+		return nil, nil, false
+	}
+	if flags&0x000001 != 0 {
+		if len(rest) < 20 {
+			return nil, nil, false
+		}
+		ivLen = int(rest[3])
+		// re-emit as a plain senc payload: version/flags then the entries
+		p = append(append([]byte(nil), p[:4]...), rest[20:]...)
+	}
+	return parseSencAuto(p, ivLen)
+}
+
+// parseSencPayload reads senc entries. With exact set, the entries must consume
+// the payload precisely (used to validate an IV-size guess).
+func parseSencPayload(payload []byte, ivLen int, exact bool) (ivs [][]byte, subs [][]subsample, ok bool) {
+	_, flags, rest, err := fullBox(payload)
 	if err != nil || len(rest) < 4 {
 		return nil, nil, false
 	}
@@ -513,6 +558,9 @@ func parseSenc(b box, ivLen int) (ivs [][]byte, subs [][]subsample, ok bool) {
 			}
 		}
 		subs = append(subs, ss)
+	}
+	if exact && len(rest) != 0 {
+		return nil, nil, false
 	}
 	return ivs, subs, true
 }

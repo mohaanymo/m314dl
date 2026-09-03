@@ -450,7 +450,7 @@ func TestDecryptSegmentSampleAESTS(t *testing.T) {
 	keys := map[[16]byte][]byte{zero: key}
 	it := item{seq: 0, key: &manifest.Key{Method: manifest.EncSampleAES, IV: iv}}
 
-	out, err := decryptSegment(context.Background(), &keyCache{}, nil, nil, keys, it, append([]byte(nil), encTS...))
+	out, err := decryptSegment(context.Background(), &keyCache{}, nil, 0, nil, keys, it, append([]byte(nil), encTS...))
 	if err != nil {
 		t.Fatal(err)
 	}

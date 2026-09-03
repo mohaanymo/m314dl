@@ -32,20 +32,9 @@ func streamIsCENC(st *manifest.Stream) bool {
 	return false
 }
 
-// newCencDecryptor fetches and parses the stream's init segment, then resolves
-// the content key. Key resolution order: the tenc default_KID, then the
-// manifest's KID, then a single unlabelled key.
-//
-// It returns (nil, nil) when the init segment shows the stream is not
-// encrypted, so the caller can use it to ask the question as well as to answer
-// it. The init is the authority: a manifest can omit ContentProtection while
-// the samples are plainly encrypted, and trusting the manifest alone means
-// passing encrypted samples through untouched — which plays as a black picture
-// with working audio, and reports no error anywhere.
-func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream) (*cencDecryptor, error) {
-	if st.Init == nil || st.Init.URL == "" {
-		return nil, fmt.Errorf("stream %s is CENC but has no init segment to read protection info from", st.ID)
-	}
+// fetchInit downloads the stream's init segment (the range slice of it, for a
+// SegmentBase-style init that shares the media file).
+func fetchInit(ctx context.Context, cfg Config, st *manifest.Stream) ([]byte, error) {
 	rng := ""
 	if st.Init.Range != nil {
 		rng = st.Init.Range.Header()
@@ -54,6 +43,20 @@ func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream) (*ce
 	if err != nil {
 		return nil, fmt.Errorf("fetch init for %s: %w", st.ID, err)
 	}
+	return initSeg, nil
+}
+
+// newCencDecryptor parses the stream's init segment, then resolves the content
+// key. Key resolution order: the tenc default_KID, then the manifest's KID,
+// then a single unlabelled key.
+//
+// It returns (nil, nil) when the init segment shows the stream is not
+// encrypted, so the caller can use it to ask the question as well as to answer
+// it. The init is the authority: a manifest can omit ContentProtection while
+// the samples are plainly encrypted, and trusting the manifest alone means
+// passing encrypted samples through untouched — which plays as a black picture
+// with working audio, and reports no error anywhere.
+func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream, initSeg []byte) (*cencDecryptor, error) {
 	info, err := mp4.ParseInit(initSeg)
 	if err != nil {
 		return nil, fmt.Errorf("parse init for %s: %w", st.ID, err)

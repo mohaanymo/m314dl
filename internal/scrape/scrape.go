@@ -11,10 +11,10 @@ import (
 )
 
 // absolute URLs in page source / inline JSON (handles \/ escaping)
-var absRe = regexp.MustCompile(`https?:(?:\\?/){2}[^\s"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?`)
+var absRe = regexp.MustCompile(`https?:(?:\\?/){2}[^\s"'<>\\]+?(?:\.(?:m3u8|mpd)|\.isml?/[Mm]anifest)(?:\?[^\s"'<>\\]*)?`)
 
 // relative manifest paths in src/href/file/source attributes
-var attrRe = regexp.MustCompile(`(?:src|href|file|source|data-src|content)\s*=\s*["']([^"']+?\.(?:m3u8|mpd)(?:\?[^"']*)?)["']`)
+var attrRe = regexp.MustCompile(`(?:src|href|file|source|data-src|content)\s*=\s*["']([^"']+?(?:\.(?:m3u8|mpd)|\.isml?/[Mm]anifest)(?:\?[^"']*)?)["']`)
 
 var iframeRe = regexp.MustCompile(`<iframe[^>]+src\s*=\s*["']([^"']+)["']`)
 

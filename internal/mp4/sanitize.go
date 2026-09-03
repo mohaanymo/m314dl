@@ -60,10 +60,10 @@ func StripFragmentProtection(frag []byte) []byte {
 				return nil, false
 			}
 			return emitBox("traf", rebuildSeq(c.payload, func(d box) ([]byte, bool) {
-				switch d.typ {
-				case "senc", "saiz", "saio":
+				switch {
+				case isProtectionBox(d):
 					return nil, true // drop
-				case "trun":
+				case d.typ == "trun":
 					return patchTrunDataOffset(d, removed), true
 				}
 				return nil, false
@@ -81,8 +81,7 @@ func removedProtectionBytes(moofPayload []byte) int {
 			return true
 		}
 		walk(tf.payload, func(d box) bool {
-			switch d.typ {
-			case "senc", "saiz", "saio":
+			if isProtectionBox(d) {
 				total += int(d.hdrLen) + len(d.payload)
 			}
 			return true
@@ -90,6 +89,16 @@ func removedProtectionBytes(moofPayload []byte) int {
 		return true
 	})
 	return total
+}
+
+// isProtectionBox reports the per-fragment sample-encryption boxes: senc and
+// its aux-info locators, or the PIFF uuid form of senc.
+func isProtectionBox(b box) bool {
+	switch b.typ {
+	case "senc", "saiz", "saio":
+		return true
+	}
+	return isUUID(b, uuidPiffSenc)
 }
 
 // patchTrunDataOffset subtracts removed from a trun's data_offset field (present

@@ -4,8 +4,10 @@ package httpx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +71,10 @@ func New(o Options) (*Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(pu)
 	}
+	// A data: URL answers from its own payload: a manifest can carry an inline
+	// init segment (Smooth Streaming synthesizes one) and the engine fetches it
+	// through the same client, retries and all, with no special case.
+	tr.RegisterProtocol("data", dataTransport{})
 	hc := &http.Client{Transport: tr, Timeout: o.Timeout, CheckRedirect: noReferer}
 	if o.CookieFile != "" {
 		jar, err := loadNetscapeCookies(o.CookieFile)
@@ -93,6 +99,43 @@ func New(o Options) (*Client, error) {
 		r = 5
 	}
 	return &Client{hc: hc, headers: headers, retries: r}, nil
+}
+
+// dataTransport serves data:[<mediatype>][;base64],<payload> URLs (RFC 2397)
+// as a 200 response. Range headers are ignored: the payload is tiny and the
+// caller already copes with a server that answers a ranged request in full.
+type dataTransport struct{}
+
+func (dataTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	meta, payload, ok := strings.Cut(req.URL.Opaque, ",")
+	if !ok {
+		return nil, fmt.Errorf("data: URL has no payload")
+	}
+	var body []byte
+	if strings.HasSuffix(meta, ";base64") {
+		b, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return nil, fmt.Errorf("data: URL: %w", err)
+		}
+		body, meta = b, strings.TrimSuffix(meta, ";base64")
+	} else {
+		s, err := url.PathUnescape(payload)
+		if err != nil {
+			return nil, fmt.Errorf("data: URL: %w", err)
+		}
+		body = []byte(s)
+	}
+	if meta == "" {
+		meta = "text/plain"
+	}
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:        http.Header{"Content-Type": {meta}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
 }
 
 // maxRedirects matches net/http's own default, which replacing CheckRedirect
