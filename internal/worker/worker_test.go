@@ -111,7 +111,7 @@ func TestWorkerChannelLifecycle(t *testing.T) {
 }
 
 func TestWorkerRequiresSecretOffLoopback(t *testing.T) {
-	if err := ServeWorker("0.0.0.0:0", "", 32, "", "test", nil); err == nil || !strings.Contains(err.Error(), "worker-secret") {
+	if err := ServeWorker("0.0.0.0:0", "", 32, "", "", "test", nil); err == nil || !strings.Contains(err.Error(), "worker-secret") {
 		t.Fatalf("got %v, want worker-secret error", err)
 	}
 }

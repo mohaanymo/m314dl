@@ -86,14 +86,20 @@ func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string,
 }
 
 // useSpool claims a staging directory for this worker and clears whatever a
-// previous run left in it.
+// previous run left in it. base is the -spool-dir override; "" resolves per
+// serve.SpoolBase (the current directory — real disk, unlike the tmpfs the
+// system temp dir usually is on Linux).
 //
 // The directory is named for the address the worker listens on, so two workers
 // on one host never share or delete each other's staging area, and a restart of
 // either reclaims exactly its own leftovers.
-func (w *workerServer) useSpool(addr string) error {
+func (w *workerServer) useSpool(addr, base string) error {
+	base, err := serve.SpoolBase(base)
+	if err != nil {
+		return err
+	}
 	name := "m314dl-worker-" + strings.NewReplacer(":", "_", "/", "_", ".", "_").Replace(addr)
-	dir := filepath.Join(os.TempDir(), name)
+	dir := filepath.Join(base, name)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("clear spool %s: %w", dir, err)
 	}
@@ -112,7 +118,7 @@ func (w *workerServer) spoolDir() string {
 	return "" // os.MkdirTemp falls back to the system temp dir
 }
 
-func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, version string, logv func(string, ...any)) error {
+func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, version string, logv func(string, ...any)) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("-worker %q: %w", addr, err)
@@ -123,7 +129,7 @@ func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, version strin
 		}
 	}
 	w := newWorkerServer(secret, maxChannels, ffmpegPath, version, logv)
-	if err := w.useSpool(addr); err != nil {
+	if err := w.useSpool(addr, spoolDir); err != nil {
 		return err
 	}
 	srv := &http.Server{Addr: addr, Handler: w.handler(), ReadHeaderTimeout: 10 * time.Second}

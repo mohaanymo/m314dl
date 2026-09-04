@@ -36,6 +36,39 @@ type Options struct {
 	Format     string // hls | ts | dash (-serve-format)
 	Transcode  string // ffmpeg output args for the ts remux path (-serve-transcode)
 	FFmpegPath string // -ffmpeg
+	SpoolDir   string // -spool-dir; "" = current directory (see SpoolBase)
+}
+
+// SpoolBase resolves the directory restream spools are created under: the
+// -spool-dir override, else the current directory, else the system temp dir
+// if the current one isn't writable. The current directory is the default on
+// purpose: a seekable VOD spools the whole decrypted asset there, and the
+// system temp dir is tmpfs on most Linux hosts — RAM, not disk — so a large
+// restream that "spooled to disk" there was filling memory until the OOM
+// killer took the process. The current directory is real disk in the normal
+// case, a container's data volume included. Warns on stderr, without failing,
+// when the resolved location is RAM-backed anyway.
+func SpoolBase(override string) (string, error) {
+	base := override
+	if base != "" {
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return "", fmt.Errorf("-spool-dir %s: %w", base, err)
+		}
+	} else {
+		base = "."
+		if probe, err := os.MkdirTemp(base, ".m314dl-probe-*"); err != nil {
+			base = os.TempDir() // cwd not writable: still run, and warn below if tmpfs
+		} else {
+			os.Remove(probe)
+		}
+	}
+	if abs, err := filepath.Abs(base); err == nil {
+		base = abs
+	}
+	if ramBacked(base) {
+		fmt.Fprintf(os.Stderr, "warning: spool dir %s is RAM-backed (tmpfs); a large VOD restream can exhaust memory — pass -spool-dir <real-disk-path>\n", base)
+	}
+	return base, nil
 }
 
 // Presentation is the output-format-agnostic surface the run loop needs: how to
@@ -62,7 +95,11 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
-	tmpDir, err := os.MkdirTemp("", "m314dl-serve-*")
+	base, err := SpoolBase(o.SpoolDir)
+	if err != nil {
+		return err
+	}
+	tmpDir, err := os.MkdirTemp(base, "m314dl-serve-*")
 	if err != nil {
 		return err
 	}
